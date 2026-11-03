@@ -1,0 +1,13 @@
+{
+	"admin/services/zapret2": {
+		"title": "Zapret2",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "zapret2/picker"
+		},
+		"depends": {
+			"acl": [ "luci-app-zapret2" ]
+		}
+	}
+}
