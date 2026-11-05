@@ -3,10 +3,10 @@
 
 pktws_check_https_tls12()
 {
-	picker_lines_tls | picker_run_lines "$1" "$2" tls12
+	picker_run_families "$1" "$2" tls12
 }
 
 pktws_check_https_tls13()
 {
-	picker_lines_tls | picker_run_lines "$1" "$2" tls13
+	picker_run_families "$1" "$2" tls13
 }

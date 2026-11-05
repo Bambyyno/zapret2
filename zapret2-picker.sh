@@ -1,8 +1,9 @@
 #!/bin/sh
 # Non-interactive strategy search for the running nfqws2 service.
+# YouTube hostnames only. TLS and QUIC stay separate profiles.
 # Success is blockcheck2's curl result (exit 0, plus HTTP 400 / foreign redirect).
-# A passing curl is not a browser result. TLS and QUIC stay separate profiles.
-# Apply rewrites only NFQWS2_OPT and NFQWS2_ENABLE.
+# One curl pass is not a browser result. The run never writes NFQWS2_OPT;
+# only the save command does, and it rewrites NFQWS2_OPT and NFQWS2_ENABLE.
 
 EXEDIR=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 ZAPRET_BASE=${ZAPRET_BASE:-$EXEDIR}
@@ -16,6 +17,9 @@ OPTFILE="$RUNDIR/opt.txt"
 NOTEFILE="$RUNDIR/notes.txt"
 
 umask 022
+
+# Fixed set. blockcheck skips a host that already answers with no bypass.
+YOUTUBE_DOMAINS="www.youtube.com youtu.be i.ytimg.com googlevideo.com youtubei.googleapis.com"
 
 die()
 {
@@ -31,25 +35,20 @@ valid_domain()
 
 parse_start_args()
 {
-	DOMAINS="www.youtube.com"
+	DOMAINS=$YOUTUBE_DOMAINS
 	IPVS=4
 	ENABLE_HTTP=0
 	ENABLE_TLS12=1
 	ENABLE_TLS13=1
 	ENABLE_QUIC=1
-	REPEATS=1
+	PASSES=3
 	while [ $# -gt 0 ]; do
 		case $1 in
-			--domains)
-				DOMAINS=$2
+			--domains|--http|--repeats)
 				shift 2
 				;;
 			--ipvs)
 				IPVS=$2
-				shift 2
-				;;
-			--http)
-				ENABLE_HTTP=$2
 				shift 2
 				;;
 			--tls12)
@@ -64,8 +63,8 @@ parse_start_args()
 				ENABLE_QUIC=$2
 				shift 2
 				;;
-			--repeats)
-				REPEATS=$2
+			--passes)
+				PASSES=$2
 				shift 2
 				;;
 			*)
@@ -77,15 +76,13 @@ parse_start_args()
 		4|6|46) ;;
 		*) die "ip version must be 4, 6 or 46" ;;
 	esac
-	case $ENABLE_HTTP in 0|1) ;; *) die "http must be 0 or 1" ;; esac
 	case $ENABLE_TLS12 in 0|1) ;; *) die "tls12 must be 0 or 1" ;; esac
 	case $ENABLE_TLS13 in 0|1) ;; *) die "tls13 must be 0 or 1" ;; esac
 	case $ENABLE_QUIC in 0|1) ;; *) die "quic must be 0 or 1" ;; esac
-	case $REPEATS in
-		1|2|3|4|5) ;;
-		*) die "repeats must be 1..5" ;;
+	case $PASSES in
+		2|3) ;;
+		*) die "passes must be 2 or 3" ;;
 	esac
-	[ -n "$DOMAINS" ] || die "domain list is empty"
 	for d in $DOMAINS; do
 		valid_domain "$d" || die "bad domain: $d"
 	done
@@ -100,17 +97,22 @@ picker_running()
 
 cmd_candidates()
 {
-	# $1 http|tls|quic
+	# $1 http|tls|quic  $2 cheap|mid|last|all
+	kind=$1
+	fam=${2:-all}
 	IPV=${IPV:-4}
 	IPVV=
 	[ "$IPV" = 6 ] && IPVV=6
 	# shellcheck disable=SC1091
 	. "$ZAPRET_BASE/blockcheck2.d/picker/candidates.inc"
-	case $1 in
-		http) picker_lines_http ;;
-		tls) picker_lines_tls ;;
-		quic) picker_lines_quic ;;
+	case $kind in
+		http|tls|quic) ;;
 		*) die "candidates: http, tls or quic" ;;
+	esac
+	case $fam in
+		cheap|mid|last) picker_lines_${kind}_$fam ;;
+		all) picker_lines_$kind ;;
+		*) die "family must be cheap, mid, last or all" ;;
 	esac
 }
 
@@ -173,11 +175,13 @@ picker_build_opt()
 {
 	hits=$1
 	[ -f "$hits" ] || die "no results"
+	# shellcheck disable=SC1091
+	. "$ZAPRET_BASE/blockcheck2.d/picker/candidates.inc"
 	work=$(mktemp -d "${TMPDIR:-/tmp}/zapret2-picker.XXXXXX") || die "mktemp"
 	while read -r proto ip dom line; do
 		[ -n "$proto" ] || continue
-		printf '%s\n' "$line" >"$work/$proto.$ip.$dom"
-		printf '%s\n' "$dom" >>"$work/$proto.$ip.doms"
+		printf '%s\n' "$line" >>"$work/$proto.$ip.$dom"
+		grep -qx "$dom" "$work/$proto.$ip.doms" 2>/dev/null || printf '%s\n' "$dom" >>"$work/$proto.$ip.doms"
 	done <"$hits"
 
 	notes=""
@@ -190,29 +194,53 @@ picker_build_opt()
 	}
 	agree()
 	{
-		# $1 proto $2 ip. Sets $agreed to the shared line.
+		# $1 proto $2 ip. Sets $agreed to the shared line with the lowest cost.
+		# A domain may have several stable lines. Domains that already opened
+		# without bypass are absent from this list and do not constrain it.
 		agreed=""
 		list="$work/$1.$2.doms"
 		[ -f "$list" ] || return 1
-		shared=""
+		common="$work/$1.$2.common"
+		: >"$common"
+		first=1
 		while read -r dom; do
 			[ -n "$dom" ] || continue
-			line=$(cat "$work/$1.$2.$dom")
-			if [ "$line" = "-" ] || [ -z "$line" ]; then
+			file="$work/$1.$2.$dom"
+			if [ ! -s "$file" ] || { [ "$(grep -c . "$file")" -eq 1 ] && grep -qx '-' "$file"; }; then
 				notes="$notes$1 ipv$2: $dom did not pass.
 "
 				return 1
 			fi
-			if [ -z "$shared" ]; then
-				shared=$line
-			elif [ "$shared" != "$line" ]; then
-				notes="$notes$1 ipv$2: domains need different lines, nothing applied for this protocol and IP version.
-"
-				return 1
+			if [ "$first" = 1 ]; then
+				cat "$file" >"$common"
+				first=0
+			else
+				nextf="$work/$1.$2.next"
+				: >"$nextf"
+				while read -r line; do
+					[ -n "$line" ] || continue
+					grep -Fx -e "$line" "$file" >/dev/null && printf '%s\n' "$line" >>"$nextf"
+				done <"$common"
+				mv "$nextf" "$common"
 			fi
 		done <"$list"
-		[ -n "$shared" ] || return 1
-		agreed=$shared
+		best=""
+		bestcost=999999
+		while read -r line; do
+			[ -n "$line" ] || continue
+			[ "$line" = "-" ] && continue
+			cost=$(picker_line_cost "$line")
+			if [ "$cost" -lt "$bestcost" ]; then
+				best=$line
+				bestcost=$cost
+			fi
+		done <"$common"
+		if [ -z "$best" ]; then
+			notes="$notes$1 ipv$2: no line passed for every tested domain.
+"
+			return 1
+		fi
+		agreed=$best
 		return 0
 	}
 
@@ -298,9 +326,12 @@ cmd_run()
 	}
 	trap 'restore_svc; echo error >"$STATE"' INT TERM
 
-	echo "curl exit 0 is the only pass. It is not a browser, not Kyber, not ECH, not a long download."
-	echo "HTTP also fails on code 400 and on a redirect to another host."
-	echo "domains=$DOMAINS ip=$IPVS http=$ENABLE_HTTP tls12=$ENABLE_TLS12 tls13=$ENABLE_TLS13 quic=$ENABLE_QUIC repeats=$REPEATS"
+	echo "curl exit 0 is one pass. It is not a browser, not Kyber, not ECH, not a long download."
+	echo "A domain that already opens is not searched."
+	echo "Families: fake and split, then TTL and blob, then wssize and ipfrag."
+	echo "Up to $PASSES passes are kept, then the shortlist is retested $PASSES times."
+	echo "NFQWS2_OPT is not written by the test."
+	echo "domains=$DOMAINS ip=$IPVS tls12=$ENABLE_TLS12 tls13=$ENABLE_TLS13 quic=$ENABLE_QUIC passes=$PASSES"
 
 	(
 		cd "$ZAPRET_BASE" || exit 1
@@ -308,14 +339,16 @@ cmd_run()
 		TEST=picker \
 		DOMAINS="$DOMAINS" \
 		IPVS="$IPVS" \
-		ENABLE_HTTP="$ENABLE_HTTP" \
+		ENABLE_HTTP=0 \
 		ENABLE_HTTPS_TLS12="$ENABLE_TLS12" \
 		ENABLE_HTTPS_TLS13="$ENABLE_TLS13" \
 		ENABLE_HTTP3="$ENABLE_QUIC" \
-		REPEATS="$REPEATS" \
+		REPEATS=1 \
 		SCANLEVEL=quick \
 		SKIP_IPBLOCK=1 \
 		PICKER_HITS="$HITS" \
+		PICKER_KEEP="$PASSES" \
+		PICKER_RETEST="$PASSES" \
 		ZAPRET_BASE="$ZAPRET_BASE" \
 		ZAPRET_CONFIG="$ZAPRET_CONFIG" \
 		sh "$ZAPRET_BASE/blockcheck2.sh"
@@ -328,6 +361,10 @@ cmd_run()
 	{
 		echo "blockcheck exit $code"
 		echo "A curl pass is not the site opening in a browser."
+		echo "NFQWS2_OPT was not written. The save button writes it."
+		if grep -q "working without bypass" "$LOG" 2>/dev/null; then
+			echo "At least one domain already opened with no bypass, so it was not searched."
+		fi
 		echo
 		if [ -s "$NOTEFILE" ]; then
 			cat "$NOTEFILE"
@@ -364,13 +401,11 @@ cmd_start_bg()
 	command -v setsid >/dev/null 2>&1 || launcher=
 	# shellcheck disable=SC2086
 	$launcher "$0" run \
-		--domains "$DOMAINS" \
 		--ipvs "$IPVS" \
-		--http "$ENABLE_HTTP" \
 		--tls12 "$ENABLE_TLS12" \
 		--tls13 "$ENABLE_TLS13" \
 		--quic "$ENABLE_QUIC" \
-		--repeats "$REPEATS" \
+		--passes "$PASSES" \
 		</dev/null >/dev/null 2>&1 &
 	echo $! >"$RUNDIR/pid"
 	echo running >"$STATE"
@@ -424,7 +459,12 @@ cmd_self_test()
 		fi
 	}
 	tls=$(IPV=4 "$0" candidates tls)
+	cheap=$(IPV=4 "$0" candidates tls cheap)
+	mid=$(IPV=4 "$0" candidates tls mid)
+	last=$(IPV=4 "$0" candidates tls last)
 	quic=$(IPV=4 "$0" candidates quic)
+	qcheap=$(IPV=4 "$0" candidates quic cheap)
+	qlast=$(IPV=4 "$0" candidates quic last)
 	http=$(IPV=4 "$0" candidates http)
 	quic6=$(IPV=6 "$0" candidates quic)
 
@@ -439,9 +479,20 @@ cmd_self_test()
 	check "tls has google sni" "printf '%s\n' \"\$tls\" | grep -q 'sni=www.google.com'"
 	check "tls has repeats 6 and 11" "printf '%s\n' \"\$tls\" | grep -q 'repeats=6' && printf '%s\n' \"\$tls\" | grep -q 'repeats=11'"
 	check "tls stays tls" "! printf '%s\n' \"\$tls\" | grep -q quic_initial"
-	check "tls count bounded" "[ \$(printf '%s\n' \"\$tls\" | grep -c .) -lt 80 ]"
-	check "no wssize" "! printf '%s\n' \"\$tls\$http\$quic\" | grep -q wssize"
+	check "tls count bounded" "[ \$(printf '%s\n' \"\$tls\" | grep -c .) -lt 90 ]"
+	check "cheap is fake and split" "printf '%s\n' \"\$cheap\" | grep -q 'fake:blob=fake_default_tls' && printf '%s\n' \"\$cheap\" | grep -q multisplit"
+	check "cheap skips ttl wssize ipfrag" "! printf '%s\n' \"\$cheap\" | grep -Eq 'ip_ttl=|wssize|ipfrag'"
+	check "mid is ttl and blob" "printf '%s\n' \"\$mid\" | grep -q 'ip_ttl=1' && printf '%s\n' \"\$mid\" | grep -q 'blob=0x00000000' && ! printf '%s\n' \"\$mid\" | grep -q wssize"
+	check "last is wssize and ipfrag" "printf '%s\n' \"\$last\" | grep -q wssize && printf '%s\n' \"\$last\" | grep -q ipfrag_pos_tcp"
+	check "quic cheap has no frag" "printf '%s\n' \"\$qcheap\" | grep -q 'repeats=1' && ! printf '%s\n' \"\$qcheap\" | grep -q ipfrag"
+	check "quic frag is last" "printf '%s\n' \"\$qlast\" | grep -q ipfrag_pos_udp"
 	check "no oob" "! printf '%s\n' \"\$tls\$http\$quic\" | grep -q lua-desync=oob"
+	# shellcheck disable=SC1091
+	. "$ZAPRET_BASE/blockcheck2.d/picker/candidates.inc"
+	c1=$(picker_line_cost "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1")
+	c11=$(picker_line_cost "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=11")
+	cw=$(picker_line_cost "--lua-desync=wssize:wsize=1:scale=6 --payload=tls_client_hello --lua-desync=multisplit:pos=2")
+	check "fewer repeats is cheaper" "[ \"$c1\" -lt \"$c11\" ] && [ \"$c11\" -lt \"$cw\" ]"
 	check "quic is quic only" "! printf '%s\n' \"\$quic\" | grep -q tls_client_hello"
 	check "quic has frag and repeats" "printf '%s\n' \"\$quic\" | grep -q 'ipfrag_pos_udp=8' && printf '%s\n' \"\$quic\" | grep -q 'repeats=1'"
 	check "quic6 has hopbyhop" "printf '%s\n' \"\$quic6\" | grep -q ip6_hopbyhop"
@@ -486,6 +537,18 @@ EOF
 	opt2=$(cat "$tmp/opt2")
 	check "ipv4 and ipv6 quic both present" "printf '%s\n' \"\$opt2\" | grep -q 'filter-l3=ipv4' && printf '%s\n' \"\$opt2\" | grep -q 'filter-l3=ipv6'"
 	check "repeats not merged" "printf '%s\n' \"\$opt2\" | grep -q 'repeats=1' && printf '%s\n' \"\$opt2\" | grep -q 'repeats=11'"
+	cat >"$hits" <<'EOF'
+tls12 4 www.youtube.com --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=11
+tls12 4 www.youtube.com --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1
+tls12 4 www.youtube.com --lua-desync=wssize:wsize=1:scale=6 --payload=tls_client_hello --lua-desync=multisplit:pos=2
+tls12 4 youtu.be --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=11
+tls12 4 youtu.be --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1
+EOF
+	NOTEFILE="$tmp/notes" picker_build_opt "$hits" >"$tmp/opt3"
+	opt3=$(cat "$tmp/opt3")
+	check "shared winner prefers repeats=1" "printf '%s\n' \"\$opt3\" | grep -q 'repeats=1'"
+	check "shared winner skips wssize" "! printf '%s\n' \"\$opt3\" | grep -q wssize"
+	check "run does not mention writing before save" "grep -q 'not written' \"$0\""
 	rm -rf "$tmp"
 	[ "$fail" = 0 ] || exit 1
 	echo self-test passed
