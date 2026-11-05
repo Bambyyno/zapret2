@@ -192,22 +192,37 @@ picker_build_opt()
 		[ -n "$opt" ] && opt="$opt --new "
 		opt="$opt$1"
 	}
+	picker_page_list()
+	{
+		printf '%s\n' "${PICKER_LIST_BASE:-${ZAPRET_BASE:-/opt/zapret2}}/ipset/zapret-hosts-picker-page.txt"
+	}
+	picker_video_list()
+	{
+		printf '%s\n' "${PICKER_LIST_BASE:-${ZAPRET_BASE:-/opt/zapret2}}/ipset/zapret-hosts-picker-video.txt"
+	}
 	agree()
 	{
-		# $1 proto $2 ip. Sets $agreed to the shared line with the lowest cost.
-		# A domain may have several stable lines. Domains that already opened
-		# without bypass are absent from this list and do not constrain it.
+		# $1 proto $2 ip $3 role (page, video, or any).
+		# Sets $agreed to the shared line with the lowest cost.
+		# Page hosts and googlevideo.com are never mixed in one call.
+		# A domain that already opened is absent and does not constrain the role.
 		agreed=""
+		role=${3:-any}
 		list="$work/$1.$2.doms"
 		[ -f "$list" ] || return 1
-		common="$work/$1.$2.common"
+		common="$work/$1.$2.$role.common"
 		: >"$common"
 		first=1
+		seen=0
 		while read -r dom; do
 			[ -n "$dom" ] || continue
+			if [ "$role" != any ]; then
+				[ "$(picker_role "$dom")" = "$role" ] || continue
+			fi
+			seen=1
 			file="$work/$1.$2.$dom"
 			if [ ! -s "$file" ] || { [ "$(grep -c . "$file")" -eq 1 ] && grep -qx '-' "$file"; }; then
-				notes="$notes$1 ipv$2: $dom did not pass.
+				notes="$notes$1 ipv$2 $role: $dom did not pass.
 "
 				return 1
 			fi
@@ -215,7 +230,7 @@ picker_build_opt()
 				cat "$file" >"$common"
 				first=0
 			else
-				nextf="$work/$1.$2.next"
+				nextf="$work/$1.$2.$role.next"
 				: >"$nextf"
 				while read -r line; do
 					[ -n "$line" ] || continue
@@ -224,6 +239,7 @@ picker_build_opt()
 				mv "$nextf" "$common"
 			fi
 		done <"$list"
+		[ "$seen" = 1 ] || return 1
 		best=""
 		bestcost=999999
 		while read -r line; do
@@ -236,12 +252,17 @@ picker_build_opt()
 			fi
 		done <"$common"
 		if [ -z "$best" ]; then
-			notes="$notes$1 ipv$2: no line passed for every tested domain.
+			notes="$notes$1 ipv$2 $role: no line passed for every tested domain in this group.
 "
 			return 1
 		fi
 		agreed=$best
 		return 0
+	}
+	video_was_tested()
+	{
+		# $1 proto $2 ip
+		[ -f "$work/$1.$2.googlevideo.com" ]
 	}
 
 	for ip in 4 6; do
@@ -250,47 +271,99 @@ picker_build_opt()
 		fi
 	done
 
-	for ip in 4 6; do
+	pick_tls_version()
+	{
+		# $1 ip $2 role. Sets $chosen.
 		t12=""
 		t13=""
-		if [ -f "$work/tls12.$ip.doms" ]; then
-			if agree tls12 "$ip"; then
-				t12=$agreed
-			fi
-		fi
-		if [ -f "$work/tls13.$ip.doms" ]; then
-			if agree tls13 "$ip"; then
-				t13=$agreed
-			fi
-		fi
 		chosen=""
+		if [ -f "$work/tls12.$1.doms" ] && agree tls12 "$1" "$2"; then
+			t12=$agreed
+		fi
+		if [ -f "$work/tls13.$1.doms" ] && agree tls13 "$1" "$2"; then
+			t13=$agreed
+		fi
 		if [ -n "$t12" ] && [ -n "$t13" ]; then
 			if [ "$t12" = "$t13" ]; then
 				chosen=$t12
 			else
 				chosen=$t12
-				notes="$notes""tls ipv$ip: TLS 1.2 and TLS 1.3 passed on different lines. The TLS 1.2 line is the one written. nfqws2 cannot filter ClientHello by the negotiated version, so the other line is not a second TLS profile.
+				notes="$notes""tls ipv$1 $2: TLS 1.2 and TLS 1.3 passed on different lines. The TLS 1.2 line is the one written.
 "
 			fi
 		elif [ -n "$t12" ]; then
 			chosen=$t12
-			[ -f "$work/tls13.$ip.doms" ] && notes="$notes""tls ipv$ip: TLS 1.3 did not pass. The TLS 1.2 line is written alone.
-"
 		elif [ -n "$t13" ]; then
 			chosen=$t13
-			[ -f "$work/tls12.$ip.doms" ] && notes="$notes""tls ipv$ip: TLS 1.2 did not pass. The TLS 1.3 line is written alone.
-"
 		fi
-		if [ -n "$chosen" ]; then
-			add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls <HOSTLIST> $chosen"
+	}
+	for ip in 4 6; do
+		pick_tls_version "$ip" page
+		page_line=$chosen
+		pick_tls_version "$ip" video
+		video_line=$chosen
+		if [ -n "$page_line" ] && [ -n "$video_line" ] && [ "$page_line" = "$video_line" ]; then
+			notes="$notes""tls ipv$ip: page and googlevideo.com passed the same line.
+"
+			add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls <HOSTLIST> $page_line"
+		else
+			if [ -n "$page_line" ]; then
+				if video_was_tested tls12 "$ip" || video_was_tested tls13 "$ip"; then
+					notes="$notes""tls ipv$ip: page line is not applied to googlevideo.com.
+"
+					add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls --hostlist=$(picker_page_list) $page_line"
+				else
+					add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls <HOSTLIST> $page_line"
+				fi
+			fi
+			if [ -n "$video_line" ]; then
+				notes="$notes""tls ipv$ip: googlevideo.com has its own line.
+"
+				add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls --hostlist=$(picker_video_list) $video_line"
+			fi
 		fi
 	done
 
+	quic_drop=0
+	quic_ok=0
 	for ip in 4 6; do
-		if agree quic "$ip"; then
-			add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> $agreed"
+		f="$work/quic.$ip.googlevideo.com"
+		if [ -f "$f" ] && [ "$(grep -c . "$f")" -eq 1 ] && grep -qx '-' "$f"; then
+			quic_drop=1
+		elif [ -f "$f" ]; then
+			quic_ok=1
 		fi
 	done
+	if [ "$quic_drop" = 1 ] && [ "$quic_ok" = 0 ]; then
+		notes="$notes""quic: no family passed for googlevideo.com. The proposal drops QUIC and keeps TCP. Nothing is written until save.
+"
+		add_profile "--filter-udp=443 --filter-l7=quic --lua-desync=drop"
+	else
+		for ip in 4 6; do
+			page_line=""
+			video_line=""
+			if agree quic "$ip" page; then
+				page_line=$agreed
+			fi
+			if agree quic "$ip" video; then
+				video_line=$agreed
+			fi
+			if [ -n "$page_line" ] && [ -n "$video_line" ] && [ "$page_line" = "$video_line" ]; then
+				add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> $page_line"
+			else
+				if [ -n "$page_line" ]; then
+					if video_was_tested quic "$ip"; then
+						add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic --hostlist=$(picker_page_list) $page_line"
+					else
+						add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> $page_line"
+					fi
+				fi
+				if [ -n "$video_line" ]; then
+					add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic --hostlist=$(picker_video_list) $video_line"
+				fi
+			fi
+		done
+	fi
 
 	# filter-l3 stays on every profile from this run. An IP version that was
 	# not tested, or that needed a different line, is not folded into the other.
@@ -329,7 +402,9 @@ cmd_run()
 	echo "curl exit 0 is one pass. It is not a browser, not Kyber, not ECH, not a long download."
 	echo "A domain that already opens is not searched."
 	echo "Families: fake and split, then TTL and blob, then wssize and ipfrag."
-	echo "Up to $PASSES passes are kept, then the shortlist is retested $PASSES times."
+	echo "If a remembered family passes again, the other families are skipped."
+	echo "www.youtube.com is the page. googlevideo.com is the video host. One does not count for the other."
+	echo "Up to $PASSES passes are kept. A much slower neighbor is dropped. The winner is retested, then once more after ${PICKER_DELAY:-3}s."
 	echo "NFQWS2_OPT is not written by the test."
 	echo "domains=$DOMAINS ip=$IPVS tls12=$ENABLE_TLS12 tls13=$ENABLE_TLS13 quic=$ENABLE_QUIC passes=$PASSES"
 
@@ -349,6 +424,8 @@ cmd_run()
 		PICKER_HITS="$HITS" \
 		PICKER_KEEP="$PASSES" \
 		PICKER_RETEST="$PASSES" \
+		PICKER_DELAY="${PICKER_DELAY:-3}" \
+		PICKER_STATE="${PICKER_STATE:-$ZAPRET_BASE/picker.state}" \
 		ZAPRET_BASE="$ZAPRET_BASE" \
 		ZAPRET_CONFIG="$ZAPRET_CONFIG" \
 		sh "$ZAPRET_BASE/blockcheck2.sh"
@@ -430,6 +507,24 @@ cmd_status()
 	fi
 }
 
+picker_write_hostlists()
+{
+	# Only the picker-owned lists. User hostlists are not touched.
+	# Called from save, not from the test run.
+	opt=$1
+	base="${PICKER_LIST_BASE:-$ZAPRET_BASE}"
+	page="${base}/ipset/zapret-hosts-picker-page.txt"
+	video="${base}/ipset/zapret-hosts-picker-video.txt"
+	printf '%s\n' "$opt" | grep -q 'zapret-hosts-picker-page.txt' && {
+		mkdir -p "${base}/ipset"
+		printf '%s\n' www.youtube.com youtu.be i.ytimg.com youtubei.googleapis.com >"$page"
+	}
+	printf '%s\n' "$opt" | grep -q 'zapret-hosts-picker-video.txt' && {
+		mkdir -p "${base}/ipset"
+		printf '%s\n' googlevideo.com >"$video"
+	}
+}
+
 cmd_apply()
 {
 	[ -s "$OPTFILE" ] || die "nothing to apply"
@@ -438,6 +533,7 @@ cmd_apply()
 	[ -f "$ZAPRET_CONFIG" ] || {
 		cp "$ZAPRET_BASE/config.default" "$ZAPRET_CONFIG"
 	}
+	picker_write_hostlists "$opt"
 	picker_write_config "$opt" 1
 	echo "NFQWS2_OPT updated. Other config keys were left as they were. NFQWS2_ENABLE=1."
 	if [ -x /etc/init.d/zapret2 ]; then
@@ -548,6 +644,28 @@ EOF
 	opt3=$(cat "$tmp/opt3")
 	check "shared winner prefers repeats=1" "printf '%s\n' \"\$opt3\" | grep -q 'repeats=1'"
 	check "shared winner skips wssize" "! printf '%s\n' \"\$opt3\" | grep -q wssize"
+	printf '%s\n' '100 fast-a' '900 slow-b' '110 fast-c' >"$tmp/slow"
+	picker_drop_slow "$tmp/slow" "$tmp/slowout"
+	check "slow neighbor dropped" "grep -qx fast-a \"$tmp/slowout\" && grep -qx fast-c \"$tmp/slowout\" && ! grep -q slow-b \"$tmp/slowout\""
+	ord=$(picker_family_order mid)
+	check "remembered family is first" "[ \"$ord\" = 'mid cheap last' ]"
+	cat >"$hits" <<'EOF'
+tls12 4 www.youtube.com --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1
+tls12 4 googlevideo.com --payload=tls_client_hello --lua-desync=multisplit:pos=2
+quic 4 www.youtube.com --payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=1
+quic 4 googlevideo.com -
+EOF
+	NOTEFILE="$tmp/notes" PICKER_LIST_BASE="$tmp" picker_build_opt "$hits" >"$tmp/opt4"
+	opt4=$(cat "$tmp/opt4")
+	check "page tls is not the video line" "printf '%s\n' \"\$opt4\" | grep -q 'zapret-hosts-picker-page.txt' && printf '%s\n' \"\$opt4\" | grep -q 'zapret-hosts-picker-video.txt'"
+	check "video keeps its own tls line" "printf '%s\n' \"\$opt4\" | grep -q 'multisplit:pos=2'"
+	check "failed video quic disables quic" "printf '%s\n' \"\$opt4\" | grep -q -- '--lua-desync=drop'"
+	check "page quic is not kept" "! printf '%s\n' \"\$opt4\" | grep -q fake_default_quic"
+	printf '%s\n' 'user-list' >"$tmp/ipset-user.txt"
+	PICKER_LIST_BASE="$tmp" picker_write_hostlists "$opt4"
+	check "picker page list written on save" "grep -qx www.youtube.com \"$tmp/ipset/zapret-hosts-picker-page.txt\""
+	check "picker video list written on save" "grep -qx googlevideo.com \"$tmp/ipset/zapret-hosts-picker-video.txt\""
+	check "user hostlist name not used" "! printf '%s\n' \"\$opt4\" | grep -q zapret-hosts-user.txt"
 	check "run does not mention writing before save" "grep -q 'not written' \"$0\""
 	rm -rf "$tmp"
 	[ "$fail" = 0 ] || exit 1

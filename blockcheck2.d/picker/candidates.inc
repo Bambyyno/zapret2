@@ -10,6 +10,8 @@
 
 PICKER_KEEP=${PICKER_KEEP:-3}
 PICKER_RETEST=${PICKER_RETEST:-3}
+PICKER_DELAY=${PICKER_DELAY:-3}
+PICKER_SLOW_FACTOR=${PICKER_SLOW_FACTOR:-3}
 
 picker_need_def()
 {
@@ -36,6 +38,130 @@ picker_line_cost()
 	pen=0
 	printf '%s\n' "$1" | grep -q 'wssize' && pen=10000
 	printf '%s\n' $((pen + rep))
+}
+
+picker_now_ms()
+{
+	if [ -r /proc/uptime ]; then
+		awk '{printf "%d\n", $1 * 1000}' /proc/uptime
+		return
+	fi
+	printf '%s\n' $(( $(date +%s) * 1000 ))
+}
+
+# googlevideo.com is the video host. A page host is never treated as video.
+picker_role()
+{
+	case $1 in
+		googlevideo.com) printf '%s\n' video ;;
+		*) printf '%s\n' page ;;
+	esac
+}
+
+# Remembered family is tried first. Anything else keeps cheap, then mid, then last.
+picker_family_order()
+{
+	case $1 in
+		cheap) printf '%s\n' "cheap mid last" ;;
+		mid) printf '%s\n' "mid cheap last" ;;
+		last) printf '%s\n' "last cheap mid" ;;
+		*) printf '%s\n' "cheap mid last" ;;
+	esac
+}
+
+picker_state_key()
+{
+	case $1 in
+		quic) kind=quic ;;
+		*) kind=tls ;;
+	esac
+	printf '%s_%s\n' "$kind" "$(picker_role "$2")"
+}
+
+picker_state_path()
+{
+	printf '%s\n' "${PICKER_STATE:-${ZAPRET_BASE:-/opt/zapret2}/picker.state}"
+}
+
+picker_remembered_family()
+{
+	file=$(picker_state_path)
+	[ -f "$file" ] || return 0
+	sed -n "s/^$1=//p" "$file" | head -n 1
+}
+
+picker_store_family()
+{
+	key=$1
+	fam=$2
+	file=$(picker_state_path)
+	mkdir -p "$(dirname "$file")"
+	tmp=$(mktemp "${TMPDIR:-/tmp}/zapret2-state.XXXXXX") || return 1
+	if [ -f "$file" ]; then
+		grep -v "^$key=" "$file" >"$tmp" || true
+	fi
+	printf '%s=%s\n' "$key" "$fam" >>"$tmp"
+	mv "$tmp" "$file"
+}
+
+# $1 input "milliseconds strategy", $2 output strategy lines.
+# A success several times slower than a neighbor in this family is dropped.
+# The fastest line is never the one dropped. wssize is not decided here.
+picker_drop_slow()
+{
+	src=$1
+	dst=$2
+	factor=${PICKER_SLOW_FACTOR:-3}
+	: >"$dst"
+	[ -s "$src" ] || return 0
+	count=$(grep -c . "$src")
+	if [ "$count" -le 1 ]; then
+		sed 's/^[0-9][0-9]* //' "$src" >"$dst"
+		return 0
+	fi
+	body=$(mktemp "${TMPDIR:-/tmp}/zapret2-slow.XXXXXX") || return 1
+	i=1
+	while read -r ms line; do
+		[ -n "$line" ] || continue
+		[ "$ms" -lt 1 ] && ms=1
+		printf '%s\n' "$ms" >"$body.ms.$i"
+		printf '%s\n' "$line" >"$body.ln.$i"
+		i=$((i + 1))
+	done <"$src"
+	count=$((i - 1))
+	i=1
+	while [ "$i" -le "$count" ]; do
+		ms=$(cat "$body.ms.$i")
+		slow=0
+		if [ "$i" -gt 1 ]; then
+			prev=$(cat "$body.ms.$((i - 1))")
+			[ "$ms" -ge $((prev * factor)) ] && slow=1
+		fi
+		if [ "$i" -lt "$count" ]; then
+			nxt=$(cat "$body.ms.$((i + 1))")
+			[ "$ms" -ge $((nxt * factor)) ] && slow=1
+		fi
+		if [ "$slow" = 0 ]; then
+			cat "$body.ln.$i" >>"$dst"
+		fi
+		i=$((i + 1))
+	done
+	if [ ! -s "$dst" ]; then
+		best_i=1
+		best_ms=$(cat "$body.ms.1")
+		i=2
+		while [ "$i" -le "$count" ]; do
+			ms=$(cat "$body.ms.$i")
+			if [ "$ms" -lt "$best_ms" ]; then
+				best_ms=$ms
+				best_i=$i
+			fi
+			i=$((i + 1))
+		done
+		cat "$body.ln.$best_i" >>"$dst"
+	fi
+	rm -f "$body".ms.* "$body".ln.*
+	rm -f "$body"
 }
 
 picker_lines_http_cheap()
@@ -178,11 +304,23 @@ picker_lines_quic()
 	picker_lines_quic_last
 }
 
-# Shortlist up to PICKER_KEEP curl passes, then retest each PICKER_RETEST times.
-# Stable lines are appended to $3, cheapest family that yields one stops the caller.
+# One more curl after a pause. The immediate retests are not enough.
+picker_recheck_later()
+{
+	fn=$1
+	dom=$2
+	shift 2
+	delay=${PICKER_DELAY:-3}
+	[ "$delay" -gt 0 ] && sleep "$delay"
+	pktws_curl_test_update "$fn" "$dom" "$@"
+}
+
+# Shortlist up to PICKER_KEEP curl passes in this family.
+# Drop a pass that is several times slower than its neighbor, retest the
+# rest, then confirm the cheapest survivor once more after PICKER_DELAY.
+# $3 receives the winning lines (usually one).
 picker_family_stable()
 {
-	# $1 curl test function, $2 domain, $3 output file. Lines on stdin.
 	fn=$1
 	dom=$2
 	out=$3
@@ -194,19 +332,29 @@ picker_family_stable()
 			\#*) continue ;;
 		esac
 		[ "$kept" -ge "$PICKER_KEEP" ] && break
+		t0=$(picker_now_ms)
 		if pktws_curl_test_update "$fn" "$dom" $line; then
-			printf '%s\n' "$line" >>"$short"
+			t1=$(picker_now_ms)
+			dt=$((t1 - t0))
+			[ "$dt" -lt 1 ] && dt=1
+			printf '%s %s\n' "$dt" "$line" >>"$short"
 			kept=$((kept + 1))
 		fi
 	done
 	if [ -s "$short" ]; then
-		sorted=$(mktemp "${TMPDIR:-/tmp}/zapret2-sort.XXXXXX") || {
+		keptf=$(mktemp "${TMPDIR:-/tmp}/zapret2-kept.XXXXXX") || {
 			rm -f "$short"
 			return 1
 		}
+		picker_drop_slow "$short" "$keptf"
+		sorted=$(mktemp "${TMPDIR:-/tmp}/zapret2-sort.XXXXXX") || {
+			rm -f "$short" "$keptf"
+			return 1
+		}
 		while IFS= read -r line; do
+			[ -n "$line" ] || continue
 			printf '%s %s\n' "$(picker_line_cost "$line")" "$line"
-		done <"$short" | sort -n | sed 's/^[0-9][0-9]* //' >"$sorted"
+		done <"$keptf" | sort -n | sed 's/^[0-9][0-9]* //' >"$sorted"
 		while IFS= read -r line; do
 			[ -n "$line" ] || continue
 			ok=0
@@ -217,15 +365,20 @@ picker_family_stable()
 				fi
 				n=$((n + 1))
 			done
-			[ "$ok" = "$PICKER_RETEST" ] && printf '%s\n' "$line" >>"$out"
+			if [ "$ok" = "$PICKER_RETEST" ] && picker_recheck_later "$fn" "$dom" $line; then
+				printf '%s\n' "$line" >>"$out"
+				break
+			fi
 		done <"$sorted"
-		rm -f "$sorted"
+		rm -f "$sorted" "$keptf"
 	fi
 	rm -f "$short"
 	[ -s "$out" ]
 }
 
 # $1 curl test function, $2 domain, $3 proto (http|tls12|tls13|quic)
+# The family that worked last time for this provider and role is tried first.
+# If it passes again, the other families are not run.
 picker_run_families()
 {
 	fn=$1
@@ -234,9 +387,10 @@ picker_run_families()
 	hits="${PICKER_HITS:-/var/run/zapret2-picker/hits}"
 	mkdir -p "$(dirname "$hits")"
 	stable=$(mktemp "${TMPDIR:-/tmp}/zapret2-stable.XXXXXX") || return 1
-	: >"$stable"
+	key=$(picker_state_key "$proto" "$dom")
+	order=$(picker_family_order "$(picker_remembered_family "$key")")
 	found=1
-	for fam in cheap mid last; do
+	for fam in $order; do
 		: >"$stable"
 		case $proto in
 			http) gen=picker_lines_http_$fam ;;
@@ -250,6 +404,7 @@ picker_run_families()
 				[ -n "$line" ] || continue
 				printf '%s %s %s %s\n' "$proto" "$IPV" "$dom" "$line" >>"$hits"
 			done <"$stable"
+			picker_store_family "$key" "$fam"
 			found=0
 			break
 		fi
