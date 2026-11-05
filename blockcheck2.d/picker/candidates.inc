@@ -1,9 +1,17 @@
-# Candidate lines for the LuCI picker.
-# Same nfqws2 arguments blockcheck2 already feeds to nfqws2.
-# Axes, and only these, match the strategy study:
-#   split position, fooling, TTL/autottl, blob, repeats.
-# Protocols stay in separate functions. TLS lines are never QUIC lines.
-# wssize, oob, http_methodeol and http_unixeol are not ordinary candidates.
+# YouTube picker candidates. Same nfqws2 arguments blockcheck2 already runs.
+# Families, cheap first:
+#   1. fake (repeats=1) and split/disorder
+#   2. TTL, autottl, blob, higher repeats
+#   3. wssize and ipfrag
+# TLS lines never contain a QUIC payload. The search does not stop on the
+# first curl success: it keeps PICKER_KEEP passes in a family, retests the
+# shortlist PICKER_RETEST times, and only then moves to a later family.
+# Lower repeats and no wssize win.
+
+PICKER_KEEP=${PICKER_KEEP:-3}
+PICKER_RETEST=${PICKER_RETEST:-3}
+PICKER_DELAY=${PICKER_DELAY:-3}
+PICKER_SLOW_FACTOR=${PICKER_SLOW_FACTOR:-3}
 
 picker_need_def()
 {
@@ -14,18 +22,166 @@ picker_need_def()
 	[ "$IPV" = 6 ] && IPVV=6
 }
 
-picker_lines_http()
+# Highest repeats= on the line. Missing repeats counts as 1.
+picker_line_repeats()
 {
-	local pos fool ttl d
+	max=1
+	n=$(printf '%s\n' "$1" | grep -o 'repeats=[0-9][0-9]*' | sed 's/^repeats=//' | sort -n | tail -n 1)
+	[ -n "$n" ] && max=$n
+	printf '%s\n' "$max"
+}
+
+# Lower is better. wssize is always worse than a line without it.
+picker_line_cost()
+{
+	rep=$(picker_line_repeats "$1")
+	pen=0
+	printf '%s\n' "$1" | grep -q 'wssize' && pen=10000
+	printf '%s\n' $((pen + rep))
+}
+
+picker_now_ms()
+{
+	if [ -r /proc/uptime ]; then
+		awk '{printf "%d\n", $1 * 1000}' /proc/uptime
+		return
+	fi
+	printf '%s\n' $(( $(date +%s) * 1000 ))
+}
+
+# googlevideo.com is the video host. A page host is never treated as video.
+picker_role()
+{
+	case $1 in
+		googlevideo.com) printf '%s\n' video ;;
+		*) printf '%s\n' page ;;
+	esac
+}
+
+# Remembered family is tried first. Anything else keeps cheap, then mid, then last.
+picker_family_order()
+{
+	case $1 in
+		cheap) printf '%s\n' "cheap mid last" ;;
+		mid) printf '%s\n' "mid cheap last" ;;
+		last) printf '%s\n' "last cheap mid" ;;
+		*) printf '%s\n' "cheap mid last" ;;
+	esac
+}
+
+picker_state_key()
+{
+	case $1 in
+		quic) kind=quic ;;
+		*) kind=tls ;;
+	esac
+	printf '%s_%s\n' "$kind" "$(picker_role "$2")"
+}
+
+picker_state_path()
+{
+	printf '%s\n' "${PICKER_STATE:-${ZAPRET_BASE:-/opt/zapret2}/picker.state}"
+}
+
+picker_remembered_family()
+{
+	file=$(picker_state_path)
+	[ -f "$file" ] || return 0
+	sed -n "s/^$1=//p" "$file" | head -n 1
+}
+
+picker_store_family()
+{
+	key=$1
+	fam=$2
+	file=$(picker_state_path)
+	mkdir -p "$(dirname "$file")"
+	tmp=$(mktemp "${TMPDIR:-/tmp}/zapret2-state.XXXXXX") || return 1
+	if [ -f "$file" ]; then
+		grep -v "^$key=" "$file" >"$tmp" || true
+	fi
+	printf '%s=%s\n' "$key" "$fam" >>"$tmp"
+	mv "$tmp" "$file"
+}
+
+# $1 input "milliseconds strategy", $2 output strategy lines.
+# A success several times slower than a neighbor in this family is dropped.
+# The fastest line is never the one dropped. wssize is not decided here.
+picker_drop_slow()
+{
+	src=$1
+	dst=$2
+	factor=${PICKER_SLOW_FACTOR:-3}
+	: >"$dst"
+	[ -s "$src" ] || return 0
+	count=$(grep -c . "$src")
+	if [ "$count" -le 1 ]; then
+		sed 's/^[0-9][0-9]* //' "$src" >"$dst"
+		return 0
+	fi
+	body=$(mktemp "${TMPDIR:-/tmp}/zapret2-slow.XXXXXX") || return 1
+	i=1
+	while read -r ms line; do
+		[ -n "$line" ] || continue
+		[ "$ms" -lt 1 ] && ms=1
+		printf '%s\n' "$ms" >"$body.ms.$i"
+		printf '%s\n' "$line" >"$body.ln.$i"
+		i=$((i + 1))
+	done <"$src"
+	count=$((i - 1))
+	i=1
+	while [ "$i" -le "$count" ]; do
+		ms=$(cat "$body.ms.$i")
+		slow=0
+		if [ "$i" -gt 1 ]; then
+			prev=$(cat "$body.ms.$((i - 1))")
+			[ "$ms" -ge $((prev * factor)) ] && slow=1
+		fi
+		if [ "$i" -lt "$count" ]; then
+			nxt=$(cat "$body.ms.$((i + 1))")
+			[ "$ms" -ge $((nxt * factor)) ] && slow=1
+		fi
+		if [ "$slow" = 0 ]; then
+			cat "$body.ln.$i" >>"$dst"
+		fi
+		i=$((i + 1))
+	done
+	if [ ! -s "$dst" ]; then
+		best_i=1
+		best_ms=$(cat "$body.ms.1")
+		i=2
+		while [ "$i" -le "$count" ]; do
+			ms=$(cat "$body.ms.$i")
+			if [ "$ms" -lt "$best_ms" ]; then
+				best_ms=$ms
+				best_i=$i
+			fi
+			i=$((i + 1))
+		done
+		cat "$body.ln.$best_i" >>"$dst"
+	fi
+	rm -f "$body".ms.* "$body".ln.*
+	rm -f "$body"
+}
+
+picker_lines_http_cheap()
+{
+	local pos fool
 	picker_need_def
+	for fool in $FOOLINGS_TCP; do
+		echo "--payload=http_req --lua-desync=fake:blob=fake_default_http:${fool}:repeats=1"
+	done
 	for pos in method+2 midsld method+2,midsld; do
 		echo "--payload=http_req --lua-desync=multisplit:pos=$pos"
 		echo "--payload=http_req --lua-desync=${MULTIDISORDER}:pos=$pos"
 	done
 	echo "--payload=http_req --lua-desync=tcpseg:pos=0,-1:seqovl=1 --lua-desync=drop"
-	for fool in $FOOLINGS_TCP; do
-		echo "--payload=http_req --lua-desync=fake:blob=fake_default_http:${fool}:repeats=1"
-	done
+}
+
+picker_lines_http_mid()
+{
+	local ttl d
+	picker_need_def
 	ttl=1
 	while [ "$ttl" -le 12 ]; do
 		echo "--payload=http_req --lua-desync=fake:blob=fake_default_http:ip${IPVV}_ttl=${ttl}:repeats=1"
@@ -41,18 +197,31 @@ picker_lines_http()
 	echo "--payload=http_req --lua-desync=fake:blob=fake_default_http:tcp_md5 --lua-desync=multisplit:pos=method+2"
 }
 
-picker_lines_tls()
+picker_lines_http_last()
 {
-	local pos fool ttl d
 	picker_need_def
+	echo "--lua-desync=wssize:wsize=1:scale=6 --payload=http_req --lua-desync=multisplit:pos=method+2"
+	echo "--payload=http_req --lua-desync=send:ipfrag:ipfrag_pos_tcp=32 --lua-desync=drop"
+}
+
+picker_lines_tls_cheap()
+{
+	local pos fool
+	picker_need_def
+	for fool in $FOOLINGS_TCP; do
+		echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:${fool}:repeats=1"
+	done
 	for pos in 2 1 sniext+1 sniext+4 host+1 midsld 1,midsld 1,midsld,1220 1,sniext+1,host+1,midsld-2,midsld,midsld+2,endhost-1; do
 		echo "--payload=tls_client_hello --lua-desync=multisplit:pos=$pos"
 		echo "--payload=tls_client_hello --lua-desync=${MULTIDISORDER}:pos=$pos"
 	done
 	echo "--payload=tls_client_hello --lua-desync=tcpseg:pos=0,-1:seqovl=1 --lua-desync=drop"
-	for fool in $FOOLINGS_TCP; do
-		echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:${fool}:repeats=1"
-	done
+}
+
+picker_lines_tls_mid()
+{
+	local ttl d
+	picker_need_def
 	ttl=1
 	while [ "$ttl" -le 12 ]; do
 		echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:ip${IPVV}_ttl=${ttl}:repeats=1"
@@ -66,23 +235,30 @@ picker_lines_tls()
 	echo "--payload=tls_client_hello --lua-desync=fake:blob=0x00000000:tcp_md5:repeats=1"
 	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tls_mod=rnd,dupsid:repeats=1"
 	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tls_mod=rnd,dupsid,rndsni:repeats=1"
-	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tls_mod=rnd,dupsid,sni=www.google.com:repeats=11"
+	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tls_mod=rnd,dupsid,sni=www.google.com:repeats=6"
 	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld"
 	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000:repeats=6 --lua-desync=multidisorder:pos=1,midsld"
 	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com --lua-desync=multidisorder:pos=1,midsld"
 }
 
-picker_lines_quic()
+picker_lines_tls_last()
 {
-	local n pos fool
+	local pos
 	picker_need_def
-	for n in 1 6 11; do
-		echo "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=$n"
+	for pos in 2 midsld 1,midsld; do
+		echo "--lua-desync=wssize:wsize=1:scale=6 --payload=tls_client_hello --lua-desync=multisplit:pos=$pos"
+		echo "--lua-desync=wssize:wsize=1:scale=6 --payload=tls_client_hello --lua-desync=${MULTIDISORDER}:pos=$pos"
 	done
 	for pos in 8 16 32 64; do
-		echo "--payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=$pos --lua-desync=drop"
-		echo "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6 --lua-desync=send:ipfrag:ipfrag_pos_udp=$pos --lua-desync=drop"
+		echo "--payload=tls_client_hello --lua-desync=send:ipfrag:ipfrag_pos_tcp=$pos --lua-desync=drop"
 	done
+}
+
+picker_lines_quic_cheap()
+{
+	local fool
+	picker_need_def
+	echo "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=1"
 	if [ "$IPV" = 6 ]; then
 		for fool in ip6_hopbyhop ip6_destopt ip6_hopbyhop:ip6_destopt; do
 			echo "--payload=quic_initial --lua-desync=send:${fool} --lua-desync=drop"
@@ -90,25 +266,153 @@ picker_lines_quic()
 	fi
 }
 
-# $1 curl test function, $2 domain, $3 proto token. Lines on stdin.
-# First curl exit 0 wins. HTTP 400 and a foreign redirect stay failures
-# because the curl test function is blockcheck's own.
-picker_run_lines()
+picker_lines_quic_mid()
 {
-	local line found=1
-	local hits="${PICKER_HITS:-/var/run/zapret2-picker/hits}"
-	mkdir -p "$(dirname "$hits")"
+	picker_need_def
+	echo "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6"
+	echo "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=11"
+}
+
+picker_lines_quic_last()
+{
+	local pos
+	picker_need_def
+	for pos in 8 16 32 64; do
+		echo "--payload=quic_initial --lua-desync=send:ipfrag:ipfrag_pos_udp=$pos --lua-desync=drop"
+		echo "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6 --lua-desync=send:ipfrag:ipfrag_pos_udp=$pos --lua-desync=drop"
+	done
+}
+
+picker_lines_http()
+{
+	picker_lines_http_cheap
+	picker_lines_http_mid
+	picker_lines_http_last
+}
+
+picker_lines_tls()
+{
+	picker_lines_tls_cheap
+	picker_lines_tls_mid
+	picker_lines_tls_last
+}
+
+picker_lines_quic()
+{
+	picker_lines_quic_cheap
+	picker_lines_quic_mid
+	picker_lines_quic_last
+}
+
+# One more curl after a pause. The immediate retests are not enough.
+picker_recheck_later()
+{
+	fn=$1
+	dom=$2
+	shift 2
+	delay=${PICKER_DELAY:-3}
+	[ "$delay" -gt 0 ] && sleep "$delay"
+	pktws_curl_test_update "$fn" "$dom" "$@"
+}
+
+# Shortlist up to PICKER_KEEP curl passes in this family.
+# Drop a pass that is several times slower than its neighbor, retest the
+# rest, then confirm the cheapest survivor once more after PICKER_DELAY.
+# $3 receives the winning lines (usually one).
+picker_family_stable()
+{
+	fn=$1
+	dom=$2
+	out=$3
+	short=$(mktemp "${TMPDIR:-/tmp}/zapret2-short.XXXXXX") || return 1
+	kept=0
 	while IFS= read -r line; do
 		[ -n "$line" ] || continue
 		case $line in
 			\#*) continue ;;
 		esac
-		if pktws_curl_test_update "$1" "$2" $line; then
-			printf '%s %s %s %s\n' "$3" "$IPV" "$2" "$line" >>"$hits"
+		[ "$kept" -ge "$PICKER_KEEP" ] && break
+		t0=$(picker_now_ms)
+		if pktws_curl_test_update "$fn" "$dom" $line; then
+			t1=$(picker_now_ms)
+			dt=$((t1 - t0))
+			[ "$dt" -lt 1 ] && dt=1
+			printf '%s %s\n' "$dt" "$line" >>"$short"
+			kept=$((kept + 1))
+		fi
+	done
+	if [ -s "$short" ]; then
+		keptf=$(mktemp "${TMPDIR:-/tmp}/zapret2-kept.XXXXXX") || {
+			rm -f "$short"
+			return 1
+		}
+		picker_drop_slow "$short" "$keptf"
+		sorted=$(mktemp "${TMPDIR:-/tmp}/zapret2-sort.XXXXXX") || {
+			rm -f "$short" "$keptf"
+			return 1
+		}
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			printf '%s %s\n' "$(picker_line_cost "$line")" "$line"
+		done <"$keptf" | sort -n | sed 's/^[0-9][0-9]* //' >"$sorted"
+		while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			ok=0
+			n=0
+			while [ "$n" -lt "$PICKER_RETEST" ]; do
+				if pktws_curl_test_update "$fn" "$dom" $line; then
+					ok=$((ok + 1))
+				fi
+				n=$((n + 1))
+			done
+			if [ "$ok" = "$PICKER_RETEST" ] && picker_recheck_later "$fn" "$dom" $line; then
+				printf '%s\n' "$line" >>"$out"
+				break
+			fi
+		done <"$sorted"
+		rm -f "$sorted" "$keptf"
+	fi
+	rm -f "$short"
+	[ -s "$out" ]
+}
+
+# $1 curl test function, $2 domain, $3 proto (http|tls12|tls13|quic)
+# The family that worked last time for this provider and role is tried first.
+# If it passes again, the other families are not run.
+picker_run_families()
+{
+	fn=$1
+	dom=$2
+	proto=$3
+	hits="${PICKER_HITS:-/var/run/zapret2-picker/hits}"
+	mkdir -p "$(dirname "$hits")"
+	stable=$(mktemp "${TMPDIR:-/tmp}/zapret2-stable.XXXXXX") || return 1
+	key=$(picker_state_key "$proto" "$dom")
+	order=$(picker_family_order "$(picker_remembered_family "$key")")
+	found=1
+	for fam in $order; do
+		: >"$stable"
+		case $proto in
+			http) gen=picker_lines_http_$fam ;;
+			tls12|tls13) gen=picker_lines_tls_$fam ;;
+			quic) gen=picker_lines_quic_$fam ;;
+			*) rm -f "$stable"; return 1 ;;
+		esac
+		$gen | picker_family_stable "$fn" "$dom" "$stable"
+		if [ -s "$stable" ]; then
+			while IFS= read -r line; do
+				[ -n "$line" ] || continue
+				printf '%s %s %s %s\n' "$proto" "$IPV" "$dom" "$line" >>"$hits"
+			done <"$stable"
+			picker_store_family "$key" "$fam"
 			found=0
 			break
 		fi
 	done
-	[ "$found" = 0 ] || printf '%s %s %s -\n' "$3" "$IPV" "$2" >>"$hits"
-	return $found
+	rm -f "$stable"
+	if [ "$found" != 0 ]; then
+		printf '%s %s %s -\n' "$proto" "$IPV" "$dom" >>"$hits"
+		return 1
+	fi
+	return 0
 }

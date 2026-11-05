@@ -21,6 +21,19 @@ function field(id, label, value) {
 	]);
 }
 
+function choice(id, label, options) {
+	var nodes = [];
+	var i;
+	for (i = 0; i < options.length; i++)
+		nodes.push(E('option', { 'value': options[i], 'selected': options[i] === '3' ? '' : null }, options[i]));
+	return E('div', { 'class': 'cbi-value' }, [
+		E('label', { 'class': 'cbi-value-title', 'for': id }, label),
+		E('div', { 'class': 'cbi-value-field' }, [
+			E('select', { 'class': 'cbi-input-select', 'id': id }, nodes)
+		])
+	]);
+}
+
 function flag(id, label, on) {
 	return E('div', { 'class': 'cbi-value' }, [
 		E('label', { 'class': 'cbi-value-title', 'for': id }, label),
@@ -93,18 +106,15 @@ return view.extend({
 		poll.add(refresh, 3);
 
 		function start() {
-			var domains = document.getElementById('zp-dom').value.trim();
 			var ipvs = document.getElementById('zp-ip').value.trim();
-			var repeats = document.getElementById('zp-rep').value.trim();
+			var passes = document.getElementById('zp-passes').value.trim();
 			return fs.exec(BIN, [
 				'start-bg',
-				'--domains', domains,
 				'--ipvs', ipvs,
-				'--http', bit('zp-http'),
 				'--tls12', bit('zp-tls12'),
 				'--tls13', bit('zp-tls13'),
 				'--quic', bit('zp-quic'),
-				'--repeats', repeats
+				'--passes', passes
 			]).then(function(res) {
 				if (res.code !== 0) {
 					ui.addNotification(null, E('pre', {}, (res.stderr || res.stdout || 'не удалось запустить')), 'error');
@@ -127,16 +137,23 @@ return view.extend({
 		return E('div', { 'class': 'cbi-map' }, [
 			E('h2', {}, 'Zapret2'),
 			E('div', { 'class': 'cbi-map-descr' },
-				'Подбор вызывает тот же nfqws2 и те же строки --lua-desync. ' +
-				'Успех — код выхода curl 0. Для HTTP дополнительно отсекаются ответ 400 и редирект на чужой хост. ' +
-				'Это не открытие страницы в браузере: нет Kyber, ECH и длинной загрузки. ' +
-				'TLS и QUIC пишутся отдельными профилями. Запись меняет только NFQWS2_OPT и NFQWS2_ENABLE.'),
+				'Домены YouTube. Страница (www.youtube.com и соседние имена) и видео (googlevideo.com) проверяются отдельно: успех страницы не считается успехом видео. ' +
+				'Если домен уже открывается без обхода, поиск по нему не идёт. ' +
+				'Семьи: fake и split/disorder, затем TTL и blob, в конце wssize и ipfrag. ' +
+				'Семья, которая уже сработала у этого провайдера, идёт первой и, если проходит снова, остальные пропускаются. ' +
+				'В одной семье слишком медленная относительно соседней строка отбрасывается. Предпочитается вариант без wssize. ' +
+				'Победитель перепроверяется сразу и ещё раз после короткой паузы. Один curl — не браузер. ' +
+				'Если для видео не прошла ни одна QUIC-семья, предложение отключает QUIC и оставляет TCP. ' +
+				'NFQWS2_OPT меняется только кнопкой записи.'),
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-section-node' }, [
-					field('zp-dom', 'Домены', 'www.youtube.com'),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, 'Домены'),
+						E('div', { 'class': 'cbi-value-field' },
+							'www.youtube.com, youtu.be, i.ytimg.com, googlevideo.com, youtubei.googleapis.com')
+					]),
 					field('zp-ip', 'IP (4, 6 или 46)', '4'),
-					field('zp-rep', 'Повторы curl (1–5)', '1'),
-					flag('zp-http', 'HTTP', false),
+					choice('zp-passes', 'Проходы и перепроверка', ['2', '3']),
 					flag('zp-tls12', 'HTTPS TLS 1.2', true),
 					flag('zp-tls13', 'HTTPS TLS 1.3', true),
 					flag('zp-quic', 'QUIC', true),
