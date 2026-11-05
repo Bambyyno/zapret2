@@ -11,6 +11,7 @@ ZAPRET_CONFIG=${ZAPRET_CONFIG:-$ZAPRET_BASE/config}
 RUNDIR=${PICKER_RUNDIR:-/var/run/zapret2-picker}
 HITS="$RUNDIR/hits"
 LOG="$RUNDIR/log"
+LIVE="$RUNDIR/live.log"
 STATE="$RUNDIR/state"
 SUMMARY="$RUNDIR/summary.txt"
 OPTFILE="$RUNDIR/opt.txt"
@@ -418,6 +419,7 @@ cmd_run()
 	mkdir -p "$RUNDIR"
 	: >"$HITS"
 	: >"$LOG"
+	: >"$LIVE"
 	: >"$SUMMARY"
 	: >"$OPTFILE"
 	: >"$NOTEFILE"
@@ -446,6 +448,7 @@ cmd_run()
 	echo "Up to $PASSES passes are kept. A much slower neighbor is dropped. The winner is retested, then once more after ${PICKER_DELAY:-3}s."
 	echo "NFQWS2_OPT is not written by the test."
 	echo "domains=$DOMAINS ip=$IPVS tls12=$ENABLE_TLS12 tls13=$ENABLE_TLS13 quic=$ENABLE_QUIC passes=$PASSES"
+	printf '%s\n' "тест запущен. NFQWS2_OPT не пишется, пока не нажата кнопка «Записать сработавшую стратегию»." >>"$LIVE"
 
 	(
 		cd "$ZAPRET_BASE" || exit 1
@@ -465,6 +468,7 @@ cmd_run()
 		PICKER_RETEST="$PASSES" \
 		PICKER_DELAY="${PICKER_DELAY:-3}" \
 		PICKER_STATE="${PICKER_STATE:-$ZAPRET_BASE/picker.state}" \
+		PICKER_LIVE="$LIVE" \
 		ZAPRET_BASE="$ZAPRET_BASE" \
 		ZAPRET_CONFIG="$ZAPRET_CONFIG" \
 		sh "$ZAPRET_BASE/blockcheck2.sh"
@@ -485,6 +489,7 @@ cmd_run()
 			echo "curl is not OpenSSL 3.5 or newer. A pass is not a Kyber pass."
 		fi
 		echo "NFQWS2_OPT was not written. The save button writes it."
+		printf '%s\n' "тест закончен. NFQWS2_OPT не записан, ждёт кнопку «Записать сработавшую стратегию»." >>"$LIVE"
 		if grep -q "working without bypass" "$LOG" 2>/dev/null; then
 			echo "At least one domain already opened with no bypass, so it was not searched."
 		fi
@@ -548,8 +553,15 @@ cmd_status()
 	echo "--- opt ---"
 	[ -f "$OPTFILE" ] && cat "$OPTFILE"
 	echo "--- log ---"
-	if [ -f "$LOG" ]; then
-		tail -n 80 "$LOG"
+	if [ -f "$LIVE" ]; then
+		lines=$(wc -l <"$LIVE" | tr -d ' ')
+		if [ "$lines" -le 180 ]; then
+			cat "$LIVE"
+		else
+			head -n 2 "$LIVE"
+			echo "..."
+			tail -n 160 "$LIVE"
+		fi
 	fi
 }
 
@@ -647,6 +659,19 @@ cmd_self_test()
 	check "every tls line is lua-desync" "! printf '%s\n' \"\$tls\" | grep -v lua-desync | grep -q ."
 
 	tmp=$(mktemp -d)
+	PICKER_LIVE="$tmp/live"
+	picker_log_try cheap www.youtube.com "--payload=tls_client_hello --lua-desync=multisplit:pos=2" 28 проба
+	picker_log_try cheap googlevideo.com "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=1" 35 проба
+	picker_log "семья cheap | $(picker_where www.youtube.com) | запомнил неудачу. repeats не увеличены."
+	picker_log "тест закончен. NFQWS2_OPT не записан, ждёт кнопку «Записать сработавшую стратегию»."
+	check "live log names family domain line and result" "grep -q 'семья cheap | страница www.youtube.com | --payload=tls_client_hello --lua-desync=multisplit:pos=2 | проба | результат: timeout' \"$tmp/live\""
+	check "video domain is labeled" "grep -q 'видео googlevideo.com' \"$tmp/live\" && grep -q 'результат: reset' \"$tmp/live\""
+	check "live log remembers failure and waits for save" "grep -q 'запомнил неудачу' \"$tmp/live\" && grep -q 'ждёт кнопку' \"$tmp/live\""
+	mkdir -p "$tmp/run"
+	cp "$tmp/live" "$tmp/run/live.log"
+	st=$(PICKER_RUNDIR="$tmp/run" "$0" status)
+	check "status prints the live log" "printf '%s\n' \"\$st\" | grep -q 'результат: timeout'"
+	unset PICKER_LIVE
 	cp "$ZAPRET_BASE/config.default" "$tmp/config"
 	printf '\nUNRELATED_SENTINEL=keep-me\nMODE_FILTER=hostlist\n' >>"$tmp/config"
 	hits="$tmp/hits"

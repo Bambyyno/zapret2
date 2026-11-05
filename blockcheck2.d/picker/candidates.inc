@@ -59,6 +59,39 @@ picker_role()
 	esac
 }
 
+picker_where()
+{
+	case $(picker_role "$1") in
+		video) printf '%s\n' "видео $1" ;;
+		*) printf '%s\n' "страница $1" ;;
+	esac
+}
+
+# open, timeout, reset, blocked. Anything else stays other.
+picker_result_word()
+{
+	case $1 in
+		0|open) printf '%s\n' open ;;
+		28|timeout) printf '%s\n' timeout ;;
+		35|52|55|56|reset) printf '%s\n' reset ;;
+		blocked) printf '%s\n' blocked ;;
+		*) printf '%s\n' other ;;
+	esac
+}
+
+picker_log()
+{
+	[ -n "${PICKER_LIVE:-}" ] || return 0
+	printf '%s\n' "$*" >>"$PICKER_LIVE"
+}
+
+# family | page or video domain | strategy line | phase | result
+picker_log_try()
+{
+	word=$(picker_result_word "$4")
+	picker_log "семья ${1} | $(picker_where "$2") | ${3} | ${5} | результат: ${word}"
+}
+
 # Canonical order. faked (fake-split and QUIC file blobs) is before wssize.
 picker_canon_families()
 {
@@ -450,8 +483,25 @@ picker_recheck_later()
 	dom=$2
 	shift 2
 	delay=${PICKER_DELAY:-3}
-	[ "$delay" -gt 0 ] && sleep "$delay"
-	pktws_curl_test_update "$fn" "$dom" "$@"
+	if [ "$delay" -gt 0 ]; then
+		picker_log "семья ${PICKER_FAMILY:-?} | $(picker_where "$dom") | пауза ${delay} с перед повторной проверкой"
+		sleep "$delay"
+	fi
+	picker_attempt "повтор после паузы" "$fn" "$dom" "$@"
+}
+
+picker_attempt()
+{
+	phase=$1
+	fn=$2
+	dom=$3
+	shift 3
+	line="$*"
+	pktws_curl_test_update "$fn" "$dom" $line
+	rc=$?
+	picker_note_result "$line" "$rc"
+	picker_log_try "${PICKER_FAMILY:-?}" "$dom" "$line" "$rc" "$phase"
+	return $rc
 }
 
 # HEAD can pass while a long body dies at the 16 KB cutoff.
@@ -462,7 +512,7 @@ picker_long_get()
 	shift 2
 	saved=${HTTPS_HEAD-}
 	HTTPS_HEAD=
-	pktws_curl_test_update "$fn" "$dom" "$@"
+	picker_attempt "длинный GET" "$fn" "$dom" "$@"
 	rc=$?
 	HTTPS_HEAD=$saved
 	return $rc
@@ -494,9 +544,8 @@ picker_family_stable()
 		esac
 		[ "$kept" -ge "$PICKER_KEEP" ] && break
 		t0=$(picker_now_ms)
-		pktws_curl_test_update "$fn" "$dom" $line
+		picker_attempt "проба" "$fn" "$dom" $line
 		rc=$?
-		picker_note_result "$line" "$rc"
 		if [ "$rc" = 0 ]; then
 			t1=$(picker_now_ms)
 			dt=$((t1 - t0))
@@ -519,19 +568,23 @@ picker_family_stable()
 			[ -n "$line" ] || continue
 			printf '%s %s\n' "$(picker_line_cost "$line")" "$line"
 		done <"$keptf" | sort -n | sed 's/^[0-9][0-9]* //' >"$sorted"
+		while read -r ms line; do
+			[ -n "$line" ] || continue
+			grep -Fx -e "$line" "$keptf" >/dev/null && continue
+			picker_log "семья ${PICKER_FAMILY:-?} | $(picker_where "$dom") | ${line} | пропуск: в несколько раз медленнее соседней"
+		done <"$short"
 		wins=0
 		while IFS= read -r line; do
 			[ -n "$line" ] || continue
 			ok=0
 			n=0
 			while [ "$n" -lt "$PICKER_RETEST" ]; do
-				pktws_curl_test_update "$fn" "$dom" $line
+				n=$((n + 1))
+				picker_attempt "перепроверка ${n}/${PICKER_RETEST}" "$fn" "$dom" $line
 				rc=$?
-				picker_note_result "$line" "$rc"
 				if [ "$rc" = 0 ]; then
 					ok=$((ok + 1))
 				fi
-				n=$((n + 1))
 			done
 			if [ "$ok" = "$PICKER_RETEST" ] && picker_long_get "$fn" "$dom" $line && picker_recheck_later "$fn" "$dom" $line; then
 				printf '%s\n' "$line" >>"$out"
@@ -558,11 +611,21 @@ picker_run_families()
 	stable=$(mktemp "${TMPDIR:-/tmp}/zapret2-stable.XXXXXX") || return 1
 	if picker_full_port_block "$dom" "$proto"; then
 		printf '%s %s %s portblock\n' "$proto" "$IPV" "$dom" >>"$hits"
+		port=${HTTPS_PORT:-443}
+		[ "$proto" = http ] && port=${HTTP_PORT:-80}
+		picker_log "семья - | $(picker_where "$dom") | порт ${port} | пропуск: полный блок IP или порта, desync не ищется | результат: blocked"
 		rm -f "$stable"
 		return 1
 	fi
 	key=$(picker_state_key "$proto" "$dom")
-	order=$(picker_order_from "$(picker_start_family "$key")")
+	remembered=$(picker_state_value "$key")
+	start=$(picker_start_family "$key")
+	case $remembered in
+		fail:*)
+			picker_log "семья ${remembered#fail:} | $(picker_where "$dom") | запомнил неудачу с прошлого раза, начинаю с семьи ${start}. repeats не увеличены."
+			;;
+	esac
+	order=$(picker_order_from "$start")
 	found=1
 	last_fail=""
 	for fam in $order; do
@@ -573,6 +636,8 @@ picker_run_families()
 			quic) gen=picker_lines_quic_$fam ;;
 			*) rm -f "$stable"; return 1 ;;
 		esac
+		PICKER_FAMILY=$fam
+		export PICKER_FAMILY
 		$gen | picker_family_stable "$fn" "$dom" "$stable"
 		if [ -s "$stable" ]; then
 			while IFS= read -r line; do
@@ -580,11 +645,20 @@ picker_run_families()
 				printf '%s %s %s %s\n' "$proto" "$IPV" "$dom" "$line" >>"$hits"
 			done <"$stable"
 			picker_store_result "$key" ok "$fam"
+			picker_log "семья ${fam} | $(picker_where "$dom") | запомнил удачную семью. остальные семьи этого домена пропускаются."
 			found=0
+			rest=0
+			for skip in $order; do
+				if [ "$rest" = 1 ]; then
+					picker_log "семья ${skip} | $(picker_where "$dom") | пропуск: семья ${fam} уже прошла"
+				fi
+				[ "$skip" = "$fam" ] && rest=1
+			done
 			break
 		fi
 		last_fail=$fam
 		picker_store_result "$key" fail "$fam"
+		picker_log "семья ${fam} | $(picker_where "$dom") | запомнил неудачу. repeats не увеличены. дальше: $(picker_next_family "$fam")"
 	done
 	rm -f "$stable"
 	if [ "$found" != 0 ]; then
