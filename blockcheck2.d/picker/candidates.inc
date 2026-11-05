@@ -37,7 +37,8 @@ picker_line_cost()
 	rep=$(picker_line_repeats "$1")
 	pen=0
 	printf '%s\n' "$1" | grep -q 'wssize' && pen=10000
-	printf '%s\n' $((pen + rep))
+	extra=$(picker_reset_penalty "$1")
+	printf '%s\n' $((pen + rep + extra))
 }
 
 picker_now_ms()
@@ -58,15 +59,82 @@ picker_role()
 	esac
 }
 
-# Remembered family is tried first. Anything else keeps cheap, then mid, then last.
-picker_family_order()
+picker_where()
+{
+	case $(picker_role "$1") in
+		video) printf '%s\n' "видео $1" ;;
+		*) printf '%s\n' "страница $1" ;;
+	esac
+}
+
+# open, timeout, reset, blocked. Anything else stays other.
+picker_result_word()
 {
 	case $1 in
-		cheap) printf '%s\n' "cheap mid last" ;;
-		mid) printf '%s\n' "mid cheap last" ;;
-		last) printf '%s\n' "last cheap mid" ;;
-		*) printf '%s\n' "cheap mid last" ;;
+		0|open) printf '%s\n' open ;;
+		28|timeout) printf '%s\n' timeout ;;
+		35|52|55|56|reset) printf '%s\n' reset ;;
+		blocked) printf '%s\n' blocked ;;
+		*) printf '%s\n' other ;;
 	esac
+}
+
+picker_log()
+{
+	[ -n "${PICKER_LIVE:-}" ] || return 0
+	printf '%s\n' "$*" >>"$PICKER_LIVE"
+}
+
+# family | page or video domain | strategy line | phase | result
+picker_log_try()
+{
+	word=$(picker_result_word "$4")
+	picker_log "семья ${1} | $(picker_where "$2") | ${3} | ${5} | результат: ${word}"
+}
+
+# Canonical order. faked (fake-split and QUIC file blobs) is before wssize.
+picker_canon_families()
+{
+	printf '%s\n' "cheap mid faked last"
+}
+
+# Families from $1 through the end. A failed family is not retried in front.
+picker_order_from()
+{
+	start=$1
+	seen=0
+	out=""
+	for f in $(picker_canon_families); do
+		if [ "$f" = "$start" ]; then
+			seen=1
+		fi
+		if [ "$seen" = 1 ]; then
+			out="${out:+$out }$f"
+		fi
+	done
+	[ -n "$out" ] || out=$(picker_canon_families)
+	printf '%s\n' "$out"
+}
+
+picker_next_family()
+{
+	found=0
+	for f in $(picker_canon_families); do
+		if [ "$found" = 1 ]; then
+			printf '%s\n' "$f"
+			return 0
+		fi
+		if [ "$f" = "$1" ]; then
+			found=1
+		fi
+	done
+	printf '%s\n' cheap
+}
+
+# Kept for older tests. A remembered success starts there and does not wrap backwards.
+picker_family_order()
+{
+	picker_order_from "${1:-cheap}"
 }
 
 picker_state_key()
@@ -75,7 +143,7 @@ picker_state_key()
 		quic) kind=quic ;;
 		*) kind=tls ;;
 	esac
-	printf '%s_%s\n' "$kind" "$(picker_role "$2")"
+	printf '%s_%s_%s\n' "$kind" "$(picker_role "$2")" "${IPV:-4}"
 }
 
 picker_state_path()
@@ -83,25 +151,91 @@ picker_state_path()
 	printf '%s\n' "${PICKER_STATE:-${ZAPRET_BASE:-/opt/zapret2}/picker.state}"
 }
 
-picker_remembered_family()
+# State values are ok:family or fail:family. A failure makes the next run start after it.
+picker_state_value()
 {
 	file=$(picker_state_path)
 	[ -f "$file" ] || return 0
 	sed -n "s/^$1=//p" "$file" | head -n 1
 }
 
-picker_store_family()
+picker_store_result()
 {
 	key=$1
-	fam=$2
+	status=$2
+	fam=$3
 	file=$(picker_state_path)
 	mkdir -p "$(dirname "$file")"
 	tmp=$(mktemp "${TMPDIR:-/tmp}/zapret2-state.XXXXXX") || return 1
 	if [ -f "$file" ]; then
-		grep -v "^$key=" "$file" >"$tmp" || true
+		grep -v "^${key}=" "$file" >"$tmp" || true
 	fi
-	printf '%s=%s\n' "$key" "$fam" >>"$tmp"
+	printf '%s=%s:%s\n' "$key" "$status" "$fam" >>"$tmp"
 	mv "$tmp" "$file"
+}
+
+picker_start_family()
+{
+	val=$(picker_state_value "$1")
+	status=${val%%:*}
+	fam=${val#*:}
+	if [ "$status" = fail ] && [ -n "$fam" ] && [ "$fam" != "$val" ]; then
+		picker_next_family "$fam"
+		return
+	fi
+	if [ "$status" = ok ] && [ -n "$fam" ] && [ "$fam" != "$val" ]; then
+		printf '%s\n' "$fam"
+		return
+	fi
+	printf '%s\n' cheap
+}
+
+# 28 is a timeout. 35, 52, 55 and 56 are a reset or a recv failure.
+picker_curl_class()
+{
+	case $1 in
+		0) printf '%s\n' ok ;;
+		28) printf '%s\n' timeout ;;
+		35|52|55|56) printf '%s\n' reset ;;
+		*) printf '%s\n' other ;;
+	esac
+}
+
+picker_fool_key()
+{
+	printf '%s\n' "$1" | grep -o -E 'badsum|tcp_md5|tcp_seq=[^: ]+|tcp_ack=[^: ]+' | head -n 1
+}
+
+picker_note_fail()
+{
+	key=$(picker_fool_key "$1")
+	[ -n "$key" ] || return 0
+	stats=${PICKER_STATS:-/tmp/zapret2-curl-stats}
+	printf '%s %s\n' "$key" "$2" >>"$stats"
+}
+
+# A fooling that fails as reset more often than as timeout is a worse score.
+picker_reset_penalty()
+{
+	key=$(picker_fool_key "$1")
+	stats=${PICKER_STATS:-/tmp/zapret2-curl-stats}
+	[ -n "$key" ] && [ -f "$stats" ] || {
+		printf '%s\n' 0
+		return
+	}
+	r=$(grep -c "^${key} reset$" "$stats" || true)
+	t=$(grep -c "^${key} timeout$" "$stats" || true)
+	if [ "$r" -ge 2 ] && [ "$r" -gt "$t" ]; then
+		printf '%s\n' 500
+	else
+		printf '%s\n' 0
+	fi
+}
+
+picker_kyber_curl()
+{
+	ver=$(${CURL:-curl} --version 2>/dev/null | head -n 5)
+	printf '%s\n' "$ver" | grep -Eq 'OpenSSL/3\.([5-9]|[1-9][0-9])'
 }
 
 # $1 input "milliseconds strategy", $2 output strategy lines.
@@ -241,6 +375,41 @@ picker_lines_tls_mid()
 	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=11:tls_mod=rnd,dupsid,sni=www.google.com --lua-desync=multidisorder:pos=1,midsld"
 }
 
+picker_lines_tls_faked()
+{
+	picker_need_def
+	echo "--payload=tls_client_hello --lua-desync=fakedsplit:pos=2:tcp_md5:repeats=1"
+	echo "--payload=tls_client_hello --lua-desync=fakeddisorder:pos=midsld:tcp_md5:repeats=1"
+	echo "--payload=tls_client_hello --lua-desync=hostfakesplit:tcp_md5:repeats=1"
+	echo "--payload=tls_client_hello --lua-desync=hostfakesplit:midhost=midsld:tcp_md5:repeats=1"
+	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1:tls_mod=rnd,dupsid,sni=www.google.com"
+	echo "--payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1:tls_mod=rnd,dupsid,sni=www.google.com --lua-desync=multisplit:pos=2"
+}
+
+picker_lines_http_faked()
+{
+	picker_need_def
+	echo "--payload=http_req --lua-desync=fakedsplit:pos=method+2:tcp_md5:repeats=1"
+	echo "--payload=http_req --lua-desync=hostfakesplit:tcp_md5:repeats=1"
+}
+
+picker_quic_blob()
+{
+	name=$1
+	file=$2
+	[ -f "$file" ] || return 0
+	echo "--blob=${name}:@${file} --payload=quic_initial --lua-desync=fake:blob=${name}:repeats=1"
+}
+
+picker_lines_quic_faked()
+{
+	base=${ZAPRET_BASE:-.}
+	picker_quic_blob quic_google "$base/files/fake/quic_initial_www_google_com.bin"
+	picker_quic_blob quic_gv "$base/files/fake/quic_initial_rr2---sn-gvnuxaxjvh-o8ge_googlevideo_com.bin"
+	picker_quic_blob quic_gv_k1 "$base/files/fake/quic_initial_rr1---sn-xguxaxjvh-n8me_googlevideo_com_kyber_1.bin"
+	picker_quic_blob quic_gv_k2 "$base/files/fake/quic_initial_rr1---sn-xguxaxjvh-n8me_googlevideo_com_kyber_2.bin"
+}
+
 picker_lines_tls_last()
 {
 	local pos
@@ -287,6 +456,7 @@ picker_lines_http()
 {
 	picker_lines_http_cheap
 	picker_lines_http_mid
+	picker_lines_http_faked
 	picker_lines_http_last
 }
 
@@ -294,6 +464,7 @@ picker_lines_tls()
 {
 	picker_lines_tls_cheap
 	picker_lines_tls_mid
+	picker_lines_tls_faked
 	picker_lines_tls_last
 }
 
@@ -301,6 +472,7 @@ picker_lines_quic()
 {
 	picker_lines_quic_cheap
 	picker_lines_quic_mid
+	picker_lines_quic_faked
 	picker_lines_quic_last
 }
 
@@ -311,8 +483,47 @@ picker_recheck_later()
 	dom=$2
 	shift 2
 	delay=${PICKER_DELAY:-3}
-	[ "$delay" -gt 0 ] && sleep "$delay"
-	pktws_curl_test_update "$fn" "$dom" "$@"
+	if [ "$delay" -gt 0 ]; then
+		picker_log "семья ${PICKER_FAMILY:-?} | $(picker_where "$dom") | пауза ${delay} с перед повторной проверкой"
+		sleep "$delay"
+	fi
+	picker_attempt "повтор после паузы" "$fn" "$dom" "$@"
+}
+
+picker_attempt()
+{
+	phase=$1
+	fn=$2
+	dom=$3
+	shift 3
+	line="$*"
+	pktws_curl_test_update "$fn" "$dom" $line
+	rc=$?
+	picker_note_result "$line" "$rc"
+	picker_log_try "${PICKER_FAMILY:-?}" "$dom" "$line" "$rc" "$phase"
+	return $rc
+}
+
+# HEAD can pass while a long body dies at the 16 KB cutoff.
+picker_long_get()
+{
+	fn=$1
+	dom=$2
+	shift 2
+	saved=${HTTPS_HEAD-}
+	HTTPS_HEAD=
+	picker_attempt "длинный GET" "$fn" "$dom" "$@"
+	rc=$?
+	HTTPS_HEAD=$saved
+	return $rc
+}
+
+picker_note_result()
+{
+	line=$1
+	rc=$2
+	class=$(picker_curl_class "$rc")
+	[ "$class" = ok ] || picker_note_fail "$line" "$class"
 }
 
 # Shortlist up to PICKER_KEEP curl passes in this family.
@@ -333,7 +544,9 @@ picker_family_stable()
 		esac
 		[ "$kept" -ge "$PICKER_KEEP" ] && break
 		t0=$(picker_now_ms)
-		if pktws_curl_test_update "$fn" "$dom" $line; then
+		picker_attempt "проба" "$fn" "$dom" $line
+		rc=$?
+		if [ "$rc" = 0 ]; then
 			t1=$(picker_now_ms)
 			dt=$((t1 - t0))
 			[ "$dt" -lt 1 ] && dt=1
@@ -355,19 +568,28 @@ picker_family_stable()
 			[ -n "$line" ] || continue
 			printf '%s %s\n' "$(picker_line_cost "$line")" "$line"
 		done <"$keptf" | sort -n | sed 's/^[0-9][0-9]* //' >"$sorted"
+		while read -r ms line; do
+			[ -n "$line" ] || continue
+			grep -Fx -e "$line" "$keptf" >/dev/null && continue
+			picker_log "семья ${PICKER_FAMILY:-?} | $(picker_where "$dom") | ${line} | пропуск: в несколько раз медленнее соседней"
+		done <"$short"
+		wins=0
 		while IFS= read -r line; do
 			[ -n "$line" ] || continue
 			ok=0
 			n=0
 			while [ "$n" -lt "$PICKER_RETEST" ]; do
-				if pktws_curl_test_update "$fn" "$dom" $line; then
+				n=$((n + 1))
+				picker_attempt "перепроверка ${n}/${PICKER_RETEST}" "$fn" "$dom" $line
+				rc=$?
+				if [ "$rc" = 0 ]; then
 					ok=$((ok + 1))
 				fi
-				n=$((n + 1))
 			done
-			if [ "$ok" = "$PICKER_RETEST" ] && picker_recheck_later "$fn" "$dom" $line; then
+			if [ "$ok" = "$PICKER_RETEST" ] && picker_long_get "$fn" "$dom" $line && picker_recheck_later "$fn" "$dom" $line; then
 				printf '%s\n' "$line" >>"$out"
-				break
+				wins=$((wins + 1))
+				[ "$wins" -ge 3 ] && break
 			fi
 		done <"$sorted"
 		rm -f "$sorted" "$keptf"
@@ -387,9 +609,25 @@ picker_run_families()
 	hits="${PICKER_HITS:-/var/run/zapret2-picker/hits}"
 	mkdir -p "$(dirname "$hits")"
 	stable=$(mktemp "${TMPDIR:-/tmp}/zapret2-stable.XXXXXX") || return 1
+	if picker_full_port_block "$dom" "$proto"; then
+		printf '%s %s %s portblock\n' "$proto" "$IPV" "$dom" >>"$hits"
+		port=${HTTPS_PORT:-443}
+		[ "$proto" = http ] && port=${HTTP_PORT:-80}
+		picker_log "семья - | $(picker_where "$dom") | порт ${port} | пропуск: полный блок IP или порта, desync не ищется | результат: blocked"
+		rm -f "$stable"
+		return 1
+	fi
 	key=$(picker_state_key "$proto" "$dom")
-	order=$(picker_family_order "$(picker_remembered_family "$key")")
+	remembered=$(picker_state_value "$key")
+	start=$(picker_start_family "$key")
+	case $remembered in
+		fail:*)
+			picker_log "семья ${remembered#fail:} | $(picker_where "$dom") | запомнил неудачу с прошлого раза, начинаю с семьи ${start}. repeats не увеличены."
+			;;
+	esac
+	order=$(picker_order_from "$start")
 	found=1
+	last_fail=""
 	for fam in $order; do
 		: >"$stable"
 		case $proto in
@@ -398,16 +636,29 @@ picker_run_families()
 			quic) gen=picker_lines_quic_$fam ;;
 			*) rm -f "$stable"; return 1 ;;
 		esac
+		PICKER_FAMILY=$fam
+		export PICKER_FAMILY
 		$gen | picker_family_stable "$fn" "$dom" "$stable"
 		if [ -s "$stable" ]; then
 			while IFS= read -r line; do
 				[ -n "$line" ] || continue
 				printf '%s %s %s %s\n' "$proto" "$IPV" "$dom" "$line" >>"$hits"
 			done <"$stable"
-			picker_store_family "$key" "$fam"
+			picker_store_result "$key" ok "$fam"
+			picker_log "семья ${fam} | $(picker_where "$dom") | запомнил удачную семью. остальные семьи этого домена пропускаются."
 			found=0
+			rest=0
+			for skip in $order; do
+				if [ "$rest" = 1 ]; then
+					picker_log "семья ${skip} | $(picker_where "$dom") | пропуск: семья ${fam} уже прошла"
+				fi
+				[ "$skip" = "$fam" ] && rest=1
+			done
 			break
 		fi
+		last_fail=$fam
+		picker_store_result "$key" fail "$fam"
+		picker_log "семья ${fam} | $(picker_where "$dom") | запомнил неудачу. repeats не увеличены. дальше: $(picker_next_family "$fam")"
 	done
 	rm -f "$stable"
 	if [ "$found" != 0 ]; then
@@ -415,4 +666,31 @@ picker_run_families()
 		return 1
 	fi
 	return 0
+}
+
+picker_full_port_block()
+{
+	dom=$1
+	proto=$2
+	port=${HTTPS_PORT:-443}
+	[ "$proto" = http ] && port=${HTTP_PORT:-80}
+	ips=""
+	if [ -n "${MDIG:-}" ] && [ -x "$MDIG" ]; then
+		ips=$(printf '%s\n' "$dom" | "$MDIG" --family="${IPV:-4}" 2>/dev/null)
+	fi
+	[ -n "$ips" ] || return 1
+	if command -v ncat >/dev/null 2>&1; then
+		probe="ncat -z -w 2"
+	else
+		return 1
+	fi
+	saw=0
+	for ip in $ips; do
+		saw=1
+		# shellcheck disable=SC2086
+		if $probe "$ip" "$port" >/dev/null 2>&1; then
+			return 1
+		fi
+	done
+	[ "$saw" = 1 ]
 }

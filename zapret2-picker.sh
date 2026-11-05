@@ -11,6 +11,7 @@ ZAPRET_CONFIG=${ZAPRET_CONFIG:-$ZAPRET_BASE/config}
 RUNDIR=${PICKER_RUNDIR:-/var/run/zapret2-picker}
 HITS="$RUNDIR/hits"
 LOG="$RUNDIR/log"
+LIVE="$RUNDIR/live.log"
 STATE="$RUNDIR/state"
 SUMMARY="$RUNDIR/summary.txt"
 OPTFILE="$RUNDIR/opt.txt"
@@ -110,9 +111,9 @@ cmd_candidates()
 		*) die "candidates: http, tls or quic" ;;
 	esac
 	case $fam in
-		cheap|mid|last) picker_lines_${kind}_$fam ;;
+		cheap|mid|faked|last) picker_lines_${kind}_$fam ;;
 		all) picker_lines_$kind ;;
-		*) die "family must be cheap, mid, last or all" ;;
+		*) die "family must be cheap, mid, faked, last or all" ;;
 	esac
 }
 
@@ -219,8 +220,13 @@ picker_build_opt()
 			if [ "$role" != any ]; then
 				[ "$(picker_role "$dom")" = "$role" ] || continue
 			fi
-			seen=1
 			file="$work/$1.$2.$dom"
+			if [ -s "$file" ] && [ "$(grep -c . "$file")" -eq 1 ] && grep -qx portblock "$file"; then
+				notes="$notes$1 ipv$2: $dom is a full IP or port block. Desync was not searched.
+"
+				continue
+			fi
+			seen=1
 			if [ ! -s "$file" ] || { [ "$(grep -c . "$file")" -eq 1 ] && grep -qx '-' "$file"; }; then
 				notes="$notes$1 ipv$2 $role: $dom did not pass.
 "
@@ -240,24 +246,68 @@ picker_build_opt()
 			fi
 		done <"$list"
 		[ "$seen" = 1 ] || return 1
-		best=""
-		bestcost=999999
+		agreed_file="$work/$1.$2.$role.best"
+		: >"$agreed_file"
+		rankraw="$work/$1.$2.$role.rankraw"
+		: >"$rankraw"
 		while read -r line; do
 			[ -n "$line" ] || continue
 			[ "$line" = "-" ] && continue
+			[ "$line" = portblock ] && continue
 			cost=$(picker_line_cost "$line")
-			if [ "$cost" -lt "$bestcost" ]; then
-				best=$line
-				bestcost=$cost
-			fi
+			printf '%s %s\n' "$cost" "$line" >>"$rankraw"
 		done <"$common"
-		if [ -z "$best" ]; then
+		sort -n "$rankraw" | head -n 3 | sed 's/^[0-9][0-9]* //' >"$agreed_file"
+		agreed=$(head -n 1 "$agreed_file")
+		if [ -z "$agreed" ]; then
 			notes="$notes$1 ipv$2 $role: no line passed for every tested domain in this group.
 "
 			return 1
 		fi
-		agreed=$best
 		return 0
+	}
+	picker_tag_line()
+	{
+		num=$1
+		shift
+		out=""
+		for tok in "$@"; do
+			case $tok in
+				--lua-desync=*) tok="${tok}:strategy=${num}" ;;
+			esac
+			out="${out:+$out }$tok"
+		done
+		printf '%s\n' "$out"
+	}
+	picker_body_from()
+	{
+		file=$1
+		count=$(grep -c . "$file")
+		body=""
+		n=0
+		if [ "$count" -ge 2 ]; then
+			body="--out-range=-s34228 --in-range=-s5556 --lua-desync=circular:fails=3 --in-range=x"
+		fi
+		while read -r line; do
+			[ -n "$line" ] || continue
+			n=$((n + 1))
+			[ "$n" -gt 3 ] && break
+			if [ "$count" -ge 2 ]; then
+				tagged=$(picker_tag_line "$n" $line)
+				body="$body $tagged"
+			else
+				body="${body:+$body }$line"
+			fi
+		done <"$file"
+		printf '%s\n' "$body"
+	}
+	page_domains()
+	{
+		printf '%s\n' "www.youtube.com,youtu.be,i.ytimg.com,youtubei.googleapis.com"
+	}
+	video_domains()
+	{
+		printf '%s\n' "googlevideo.com"
 	}
 	video_was_tested()
 	{
@@ -273,28 +323,33 @@ picker_build_opt()
 
 	pick_tls_version()
 	{
-		# $1 ip $2 role. Sets $chosen.
+		# $1 ip $2 role. Sets $chosen and copies up to three lines.
 		t12=""
 		t13=""
 		chosen=""
+		src=""
 		if [ -f "$work/tls12.$1.doms" ] && agree tls12 "$1" "$2"; then
 			t12=$agreed
+			src=$agreed_file
 		fi
 		if [ -f "$work/tls13.$1.doms" ] && agree tls13 "$1" "$2"; then
 			t13=$agreed
+			[ -n "$src" ] || src=$agreed_file
 		fi
-		if [ -n "$t12" ] && [ -n "$t13" ]; then
-			if [ "$t12" = "$t13" ]; then
-				chosen=$t12
-			else
-				chosen=$t12
-				notes="$notes""tls ipv$1 $2: TLS 1.2 and TLS 1.3 passed on different lines. The TLS 1.2 line is the one written.
+		if [ -n "$t12" ] && [ -n "$t13" ] && [ "$t12" != "$t13" ]; then
+			notes="$notes""tls ipv$1 $2: TLS 1.2 and TLS 1.3 passed on different lines. The TLS 1.2 lines are the ones written.
 "
-			fi
-		elif [ -n "$t12" ]; then
+		fi
+		if [ -n "$t12" ]; then
 			chosen=$t12
+			# agree tls13 overwrote agreed_file. Re-run tls12 to restore its set.
+			agree tls12 "$1" "$2"
+			src=$agreed_file
 		elif [ -n "$t13" ]; then
 			chosen=$t13
+		fi
+		if [ -n "$src" ]; then
+			cp "$src" "$work/tls.$1.$2.best"
 		fi
 	}
 	for ip in 4 6; do
@@ -302,25 +357,15 @@ picker_build_opt()
 		page_line=$chosen
 		pick_tls_version "$ip" video
 		video_line=$chosen
-		if [ -n "$page_line" ] && [ -n "$video_line" ] && [ "$page_line" = "$video_line" ]; then
-			notes="$notes""tls ipv$ip: page and googlevideo.com passed the same line.
+		if [ -n "$page_line" ]; then
+			body=$(picker_body_from "$work/tls.$ip.page.best")
+			add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls --hostlist-domains=$(page_domains) $body"
+		fi
+		if [ -n "$video_line" ]; then
+			body=$(picker_body_from "$work/tls.$ip.video.best")
+			notes="$notes""tls ipv$ip: googlevideo.com is its own profile.
 "
-			add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls <HOSTLIST> $page_line"
-		else
-			if [ -n "$page_line" ]; then
-				if video_was_tested tls12 "$ip" || video_was_tested tls13 "$ip"; then
-					notes="$notes""tls ipv$ip: page line is not applied to googlevideo.com.
-"
-					add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls --hostlist=$(picker_page_list) $page_line"
-				else
-					add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls <HOSTLIST> $page_line"
-				fi
-			fi
-			if [ -n "$video_line" ]; then
-				notes="$notes""tls ipv$ip: googlevideo.com has its own line.
-"
-				add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls --hostlist=$(picker_video_list) $video_line"
-			fi
+			add_profile "--filter-l3=ipv$ip --filter-tcp=443 --filter-l7=tls --hostlist-domains=$(video_domains) $body"
 		fi
 	done
 
@@ -348,19 +393,13 @@ picker_build_opt()
 			if agree quic "$ip" video; then
 				video_line=$agreed
 			fi
-			if [ -n "$page_line" ] && [ -n "$video_line" ] && [ "$page_line" = "$video_line" ]; then
-				add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> $page_line"
-			else
-				if [ -n "$page_line" ]; then
-					if video_was_tested quic "$ip"; then
-						add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic --hostlist=$(picker_page_list) $page_line"
-					else
-						add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> $page_line"
-					fi
-				fi
-				if [ -n "$video_line" ]; then
-					add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic --hostlist=$(picker_video_list) $video_line"
-				fi
+			if [ -n "$page_line" ]; then
+				body=$(picker_body_from "$work/quic.$ip.page.best")
+				add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic --hostlist-domains=$(page_domains) $body"
+			fi
+			if [ -n "$video_line" ]; then
+				body=$(picker_body_from "$work/quic.$ip.video.best")
+				add_profile "--filter-l3=ipv$ip --filter-udp=443 --filter-l7=quic --hostlist-domains=$(video_domains) $body"
 			fi
 		done
 	fi
@@ -380,6 +419,7 @@ cmd_run()
 	mkdir -p "$RUNDIR"
 	: >"$HITS"
 	: >"$LOG"
+	: >"$LIVE"
 	: >"$SUMMARY"
 	: >"$OPTFILE"
 	: >"$NOTEFILE"
@@ -401,12 +441,14 @@ cmd_run()
 
 	echo "curl exit 0 is one pass. It is not a browser, not Kyber, not ECH, not a long download."
 	echo "A domain that already opens is not searched."
-	echo "Families: fake and split, then TTL and blob, then wssize and ipfrag."
-	echo "If a remembered family passes again, the other families are skipped."
+	echo "Families: fake and split, TTL and blob, fakedsplit and QUIC blobs, then wssize and ipfrag."
+	echo "A remembered failure starts at the next family. repeats are not raised."
+	echo "Two or three passing lines are saved as circular strategy numbers."
 	echo "www.youtube.com is the page. googlevideo.com is the video host. One does not count for the other."
 	echo "Up to $PASSES passes are kept. A much slower neighbor is dropped. The winner is retested, then once more after ${PICKER_DELAY:-3}s."
 	echo "NFQWS2_OPT is not written by the test."
 	echo "domains=$DOMAINS ip=$IPVS tls12=$ENABLE_TLS12 tls13=$ENABLE_TLS13 quic=$ENABLE_QUIC passes=$PASSES"
+	printf '%s\n' "тест запущен. NFQWS2_OPT не пишется, пока не нажата кнопка «Записать сработавшую стратегию»." >>"$LIVE"
 
 	(
 		cd "$ZAPRET_BASE" || exit 1
@@ -426,6 +468,7 @@ cmd_run()
 		PICKER_RETEST="$PASSES" \
 		PICKER_DELAY="${PICKER_DELAY:-3}" \
 		PICKER_STATE="${PICKER_STATE:-$ZAPRET_BASE/picker.state}" \
+		PICKER_LIVE="$LIVE" \
 		ZAPRET_BASE="$ZAPRET_BASE" \
 		ZAPRET_CONFIG="$ZAPRET_CONFIG" \
 		sh "$ZAPRET_BASE/blockcheck2.sh"
@@ -436,9 +479,17 @@ cmd_run()
 		NOTEFILE="$NOTEFILE" picker_build_opt "$HITS" >"$OPTFILE" || true
 	fi
 	{
+		# shellcheck disable=SC1091
+		. "$ZAPRET_BASE/blockcheck2.d/picker/candidates.inc"
 		echo "blockcheck exit $code"
 		echo "A curl pass is not the site opening in a browser."
+		if picker_kyber_curl; then
+			echo "curl is OpenSSL 3.5 or newer, so Kyber may be in the ClientHello."
+		else
+			echo "curl is not OpenSSL 3.5 or newer. A pass is not a Kyber pass."
+		fi
 		echo "NFQWS2_OPT was not written. The save button writes it."
+		printf '%s\n' "тест закончен. NFQWS2_OPT не записан, ждёт кнопку «Записать сработавшую стратегию»." >>"$LIVE"
 		if grep -q "working without bypass" "$LOG" 2>/dev/null; then
 			echo "At least one domain already opened with no bypass, so it was not searched."
 		fi
@@ -502,8 +553,15 @@ cmd_status()
 	echo "--- opt ---"
 	[ -f "$OPTFILE" ] && cat "$OPTFILE"
 	echo "--- log ---"
-	if [ -f "$LOG" ]; then
-		tail -n 80 "$LOG"
+	if [ -f "$LIVE" ]; then
+		lines=$(wc -l <"$LIVE" | tr -d ' ')
+		if [ "$lines" -le 180 ]; then
+			cat "$LIVE"
+		else
+			head -n 2 "$LIVE"
+			echo "..."
+			tail -n 160 "$LIVE"
+		fi
 	fi
 }
 
@@ -575,7 +633,12 @@ cmd_self_test()
 	check "tls has google sni" "printf '%s\n' \"\$tls\" | grep -q 'sni=www.google.com'"
 	check "tls has repeats 6 and 11" "printf '%s\n' \"\$tls\" | grep -q 'repeats=6' && printf '%s\n' \"\$tls\" | grep -q 'repeats=11'"
 	check "tls stays tls" "! printf '%s\n' \"\$tls\" | grep -q quic_initial"
-	check "tls count bounded" "[ \$(printf '%s\n' \"\$tls\" | grep -c .) -lt 90 ]"
+	check "tls count bounded" "[ \$(printf '%s\n' \"\$tls\" | grep -c .) -lt 140 ]"
+	faked=$(IPV=4 "$0" candidates tls faked)
+	qfaked=$(IPV=4 ZAPRET_BASE="$ZAPRET_BASE" "$0" candidates quic faked)
+	check "faked before wssize" "printf '%s\n' \"\$faked\" | grep -q fakedsplit && printf '%s\n' \"\$faked\" | grep -q hostfakesplit && ! printf '%s\n' \"\$faked\" | grep -q wssize"
+	check "sni variant stays repeats 1" "printf '%s\n' \"\$faked\" | grep -q 'sni=www.google.com' && printf '%s\n' \"\$faked\" | grep 'sni=www.google.com' | grep -q 'repeats=1'"
+	check "quic blobs before frag" "printf '%s\n' \"\$qfaked\" | grep -q 'quic_initial_www_google_com.bin' && ! printf '%s\n' \"\$qfaked\" | grep -q ipfrag"
 	check "cheap is fake and split" "printf '%s\n' \"\$cheap\" | grep -q 'fake:blob=fake_default_tls' && printf '%s\n' \"\$cheap\" | grep -q multisplit"
 	check "cheap skips ttl wssize ipfrag" "! printf '%s\n' \"\$cheap\" | grep -Eq 'ip_ttl=|wssize|ipfrag'"
 	check "mid is ttl and blob" "printf '%s\n' \"\$mid\" | grep -q 'ip_ttl=1' && printf '%s\n' \"\$mid\" | grep -q 'blob=0x00000000' && ! printf '%s\n' \"\$mid\" | grep -q wssize"
@@ -596,6 +659,19 @@ cmd_self_test()
 	check "every tls line is lua-desync" "! printf '%s\n' \"\$tls\" | grep -v lua-desync | grep -q ."
 
 	tmp=$(mktemp -d)
+	PICKER_LIVE="$tmp/live"
+	picker_log_try cheap www.youtube.com "--payload=tls_client_hello --lua-desync=multisplit:pos=2" 28 проба
+	picker_log_try cheap googlevideo.com "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=1" 35 проба
+	picker_log "семья cheap | $(picker_where www.youtube.com) | запомнил неудачу. repeats не увеличены."
+	picker_log "тест закончен. NFQWS2_OPT не записан, ждёт кнопку «Записать сработавшую стратегию»."
+	check "live log names family domain line and result" "grep -q 'семья cheap | страница www.youtube.com | --payload=tls_client_hello --lua-desync=multisplit:pos=2 | проба | результат: timeout' \"$tmp/live\""
+	check "video domain is labeled" "grep -q 'видео googlevideo.com' \"$tmp/live\" && grep -q 'результат: reset' \"$tmp/live\""
+	check "live log remembers failure and waits for save" "grep -q 'запомнил неудачу' \"$tmp/live\" && grep -q 'ждёт кнопку' \"$tmp/live\""
+	mkdir -p "$tmp/run"
+	cp "$tmp/live" "$tmp/run/live.log"
+	st=$(PICKER_RUNDIR="$tmp/run" "$0" status)
+	check "status prints the live log" "printf '%s\n' \"\$st\" | grep -q 'результат: timeout'"
+	unset PICKER_LIVE
 	cp "$ZAPRET_BASE/config.default" "$tmp/config"
 	printf '\nUNRELATED_SENTINEL=keep-me\nMODE_FILTER=hostlist\n' >>"$tmp/config"
 	hits="$tmp/hits"
@@ -613,7 +689,7 @@ EOF
 	check "prefer tls12 line" "printf '%s\n' \"\$opt\" | grep -q 'multisplit:pos=2'"
 	check "tls13 line not applied" "! printf '%s\n' \"\$opt\" | grep -q 'multidisorder:pos=1'"
 	check "failed http omitted" "! printf '%s\n' \"\$opt\" | grep -q 'filter-l7=http'"
-	check "hostlist markers kept" "printf '%s\n' \"\$opt\" | grep -q '<HOSTLIST>' && printf '%s\n' \"\$opt\" | grep -q '<HOSTLIST_NOAUTO>'"
+	check "page uses hostlist-domains" "printf '%s\n' \"\$opt\" | grep -q 'hostlist-domains=www.youtube.com,youtu.be,i.ytimg.com,youtubei.googleapis.com'"
 	check "ipv4 filter on partial test" "printf '%s\n' \"\$opt\" | grep -q 'filter-l3=ipv4'"
 	ZAPRET_CONFIG="$tmp/config" picker_write_config "$opt" 1
 	check "sentinel kept" "grep -q '^UNRELATED_SENTINEL=keep-me$' \"$tmp/config\""
@@ -647,8 +723,15 @@ EOF
 	printf '%s\n' '100 fast-a' '900 slow-b' '110 fast-c' >"$tmp/slow"
 	picker_drop_slow "$tmp/slow" "$tmp/slowout"
 	check "slow neighbor dropped" "grep -qx fast-a \"$tmp/slowout\" && grep -qx fast-c \"$tmp/slowout\" && ! grep -q slow-b \"$tmp/slowout\""
-	ord=$(picker_family_order mid)
-	check "remembered family is first" "[ \"$ord\" = 'mid cheap last' ]"
+	ord=$(picker_order_from "$(picker_next_family cheap)")
+	check "failure steps to the next family" "[ \"$ord\" = 'mid faked last' ]"
+	check "last failure wraps to cheap" "[ \"$(picker_next_family last)\" = cheap ]"
+	check "timeout and reset differ" "[ \"$(picker_curl_class 28)\" = timeout ] && [ \"$(picker_curl_class 35)\" = reset ]"
+	PICKER_STATS="$tmp/stats"
+	printf '%s\n' 'tcp_md5 reset' 'tcp_md5 reset' >"$PICKER_STATS"
+	pen=$(picker_reset_penalty "--payload=tls_client_hello --lua-desync=fake:tcp_md5:repeats=1")
+	check "reset fooling is penalized" "[ \"$pen\" = 500 ]"
+	unset PICKER_STATS
 	cat >"$hits" <<'EOF'
 tls12 4 www.youtube.com --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1
 tls12 4 googlevideo.com --payload=tls_client_hello --lua-desync=multisplit:pos=2
@@ -657,15 +740,20 @@ quic 4 googlevideo.com -
 EOF
 	NOTEFILE="$tmp/notes" PICKER_LIST_BASE="$tmp" picker_build_opt "$hits" >"$tmp/opt4"
 	opt4=$(cat "$tmp/opt4")
-	check "page tls is not the video line" "printf '%s\n' \"\$opt4\" | grep -q 'zapret-hosts-picker-page.txt' && printf '%s\n' \"\$opt4\" | grep -q 'zapret-hosts-picker-video.txt'"
+	check "page and video are separate domains" "printf '%s\n' \"\$opt4\" | grep -q 'hostlist-domains=www.youtube.com,youtu.be,i.ytimg.com,youtubei.googleapis.com' && printf '%s\n' \"\$opt4\" | grep -q 'hostlist-domains=googlevideo.com'"
 	check "video keeps its own tls line" "printf '%s\n' \"\$opt4\" | grep -q 'multisplit:pos=2'"
 	check "failed video quic disables quic" "printf '%s\n' \"\$opt4\" | grep -q -- '--lua-desync=drop'"
 	check "page quic is not kept" "! printf '%s\n' \"\$opt4\" | grep -q fake_default_quic"
-	printf '%s\n' 'user-list' >"$tmp/ipset-user.txt"
-	PICKER_LIST_BASE="$tmp" picker_write_hostlists "$opt4"
-	check "picker page list written on save" "grep -qx www.youtube.com \"$tmp/ipset/zapret-hosts-picker-page.txt\""
-	check "picker video list written on save" "grep -qx googlevideo.com \"$tmp/ipset/zapret-hosts-picker-video.txt\""
 	check "user hostlist name not used" "! printf '%s\n' \"\$opt4\" | grep -q zapret-hosts-user.txt"
+	cat >"$hits" <<'EOF'
+tls12 4 www.youtube.com --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1
+tls12 4 www.youtube.com --payload=tls_client_hello --lua-desync=multisplit:pos=2
+tls12 4 youtu.be --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:repeats=1
+tls12 4 youtu.be --payload=tls_client_hello --lua-desync=multisplit:pos=2
+EOF
+	NOTEFILE="$tmp/notes" picker_build_opt "$hits" >"$tmp/opt5"
+	opt5=$(cat "$tmp/opt5")
+	check "two lines become circular" "printf '%s\n' \"\$opt5\" | grep -q 'circular:fails=3' && printf '%s\n' \"\$opt5\" | grep -q 'strategy=1' && printf '%s\n' \"\$opt5\" | grep -q 'strategy=2'"
 	check "run does not mention writing before save" "grep -q 'not written' \"$0\""
 	rm -rf "$tmp"
 	[ "$fail" = 0 ] || exit 1

@@ -97,13 +97,19 @@ return view.extend({
 			return fs.exec(BIN, ['status']).then(function(res) {
 				var next = splitStatus((res && res.stdout) || '');
 				stateNode.textContent = next.state;
-				summaryNode.textContent = next.summary || 'Тест ещё не запускался.';
+				if (next.summary)
+					summaryNode.textContent = next.summary;
+				else if (next.state === 'running')
+					summaryNode.textContent = 'Тест идёт. NFQWS2_OPT не пишется, пока не нажата кнопка записи.';
+				else
+					summaryNode.textContent = 'Тест ещё не запускался.';
 				optNode.textContent = next.opt;
 				logNode.textContent = next.log;
+				logNode.scrollTop = logNode.scrollHeight;
 			});
 		}
 
-		poll.add(refresh, 3);
+		poll.add(refresh, 1);
 
 		function start() {
 			var ipvs = document.getElementById('zp-ip').value.trim();
@@ -139,11 +145,13 @@ return view.extend({
 			E('div', { 'class': 'cbi-map-descr' },
 				'Домены YouTube. Страница (www.youtube.com и соседние имена) и видео (googlevideo.com) проверяются отдельно: успех страницы не считается успехом видео. ' +
 				'Если домен уже открывается без обхода, поиск по нему не идёт. ' +
-				'Семьи: fake и split/disorder, затем TTL и blob, в конце wssize и ipfrag. ' +
-				'Семья, которая уже сработала у этого провайдера, идёт первой и, если проходит снова, остальные пропускаются. ' +
+				'Семьи: fake и split, TTL и blob, fakedsplit и QUIC-blob, затем wssize. ' +
+				'Если запомненная семья снова не проходит, следующая начинается со следующей семьи, без увеличения repeats. ' +
+				'Две или три прошедшие строки пишутся как circular strategy=1..3. Страница и googlevideo.com — разные --hostlist-domains. ' +
 				'В одной семье слишком медленная относительно соседней строка отбрасывается. Предпочитается вариант без wssize. ' +
 				'Победитель перепроверяется сразу и ещё раз после короткой паузы. Один curl — не браузер. ' +
 				'Если для видео не прошла ни одна QUIC-семья, предложение отключает QUIC и оставляет TCP. ' +
+				'Журнал обновляется каждую секунду: семья, страница или googlevideo.com, строка --lua-desync и результат open, timeout, reset или blocked. ' +
 				'NFQWS2_OPT меняется только кнопкой записи.'),
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-section-node' }, [

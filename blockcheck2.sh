@@ -1435,16 +1435,31 @@ check_domain_prolog()
 	echo
 	echo \* $1 ipv$IPV $3
 
+	if [ -n "${PICKER_LIVE:-}" ] && [ -z "${PICKER_LOG_READY:-}" ]; then
+		# shellcheck disable=SC1091
+		. "$ZAPRET_BASE/blockcheck2.d/picker/candidates.inc"
+		PICKER_LOG_READY=1
+	fi
 	echo "- checking without DPI bypass"
-	curl_test $1 $3 && {
+	if curl_test $1 $3; then
 		report_append "$3" "$1 ipv${IPV}" "working without bypass"
+		if [ -n "${PICKER_LIVE:-}" ]; then
+			picker_log "семья - | $(picker_where "$3") | строка: без обхода | пропуск: домен уже открывается, desync не ищется | результат: open"
+		fi
 		[ "$SCANLEVEL" = force ] || return 1
-	}
-	code=$?
-	curl_has_reason_to_continue $code || {
-		report_append "$3" "$1 ipv${IPV}" "test aborted, no reason to continue. curl code $(curl_translate_code $code)"
-		return 1
-	}
+	else
+		code=$?
+		if [ -n "${PICKER_LIVE:-}" ]; then
+			picker_log "семья - | $(picker_where "$3") | строка: без обхода | результат: $(picker_result_word "$code")"
+		fi
+		curl_has_reason_to_continue $code || {
+			report_append "$3" "$1 ipv${IPV}" "test aborted, no reason to continue. curl code $(curl_translate_code $code)"
+			if [ -n "${PICKER_LIVE:-}" ]; then
+				picker_log "семья - | $(picker_where "$3") | пропуск: curl не даёт продолжать тест"
+			fi
+			return 1
+		}
+	fi
 	return 0
 }
 check_domain_http_tcp()

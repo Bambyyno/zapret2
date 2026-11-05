@@ -1,14 +1,14 @@
 #!/bin/sh
 # Install zapret2 as an OpenWrt package so Software can remove it.
 #
-#   uclient-fetch -O /tmp/install_openwrt.sh https://raw.githubusercontent.com/Bambyyno/zapret2/cursor/zapret2-apk-96e1/install_openwrt.sh && sh /tmp/install_openwrt.sh
+#   uclient-fetch -O /tmp/install_openwrt.sh https://raw.githubusercontent.com/Bambyyno/zapret2/cursor/picker-adapt-96e1/install_openwrt.sh && sh /tmp/install_openwrt.sh
 #
 # OpenWrt 25.12 (apk, ramips/mt7621) installs zapret2-mipsel_24kc.apk.
 # apk del zapret2 removes the init script, hotplug hook, and LuCI page.
 # /opt/zapret2/config is a conffile and is kept when it was modified.
 
 FORK_REPO=Bambyyno/zapret2
-FORK_REF=cursor/zapret2-apk-96e1
+FORK_REF=cursor/picker-adapt-96e1
 APK_NAME=zapret2-mipsel_24kc.apk
 APK_URL=${APK_URL:-https://raw.githubusercontent.com/$FORK_REPO/$FORK_REF/openwrt/bin/$APK_NAME}
 
