@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=zapret2
 PKG_VERSION:=1.0.6
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=Bambyyno
@@ -34,6 +34,15 @@ fi
 if [ -z "$${IPKG_INSTROOT}" ] && [ -x /etc/init.d/zapret2 ]; then
 	/etc/init.d/zapret2 stop || true
 	/etc/init.d/zapret2 disable || true
+fi
+exit 0
+endef
+
+define Package/zapret2/postinst
+#!/bin/sh
+# The new ACL is read when rpcd starts. A running session keeps the old list.
+if [ -z "$${IPKG_INSTROOT}" ] && [ -x /etc/init.d/rpcd ]; then
+	/etc/init.d/rpcd reload || true
 fi
 exit 0
 endef
