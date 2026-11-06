@@ -70,14 +70,25 @@ function splitStatus(text) {
 
 return view.extend({
 	load: function() {
-		return fs.exec(BIN, ['status']).then(function(res) {
-			return (res && res.stdout) || '';
-		}).catch(function() {
-			return '';
-		});
+		return Promise.all([
+			fs.exec(BIN, ['status']).then(function(res) {
+				return (res && res.stdout) || '';
+			}).catch(function(err) {
+				return 'state=idle\n--- summary ---\n' + (err.message || err);
+			}),
+			fs.exec(BIN, ['show-opt']).then(function(res) {
+				if (!res || res.code !== 0)
+					return (res && (res.stderr || res.stdout)) || '';
+				return res.stdout || '';
+			}).catch(function() {
+				return '';
+			})
+		]);
 	},
 
-	render: function(raw) {
+	render: function(data) {
+		var raw = data[0];
+		var custom = data[1] || '';
 		var parsed = splitStatus(raw);
 		var stateNode = E('div', { 'id': 'zp-state' }, parsed.state);
 		var summaryNode = E('pre', {
@@ -93,20 +104,28 @@ return view.extend({
 			'style': 'white-space:pre-wrap; max-height:20em; overflow:auto'
 		}, parsed.log || '');
 
+		function showSummary(next) {
+			if (next.summary)
+				summaryNode.textContent = next.summary;
+			else if (next.state === 'running')
+				summaryNode.textContent = 'Тест идёт. NFQWS2_OPT не пишется, пока не нажата кнопка записи.';
+			else if (!summaryNode.textContent)
+				summaryNode.textContent = 'Тест ещё не запускался.';
+		}
+
+		function showError(err) {
+			summaryNode.textContent = (err && err.message) ? err.message : String(err || 'не удалось выполнить команду');
+		}
+
 		function refresh() {
 			return fs.exec(BIN, ['status']).then(function(res) {
 				var next = splitStatus((res && res.stdout) || '');
 				stateNode.textContent = next.state;
-				if (next.summary)
-					summaryNode.textContent = next.summary;
-				else if (next.state === 'running')
-					summaryNode.textContent = 'Тест идёт. NFQWS2_OPT не пишется, пока не нажата кнопка записи.';
-				else
-					summaryNode.textContent = 'Тест ещё не запускался.';
+				showSummary(next);
 				optNode.textContent = next.opt;
 				logNode.textContent = next.log;
 				logNode.scrollTop = logNode.scrollHeight;
-			});
+			}).catch(showError);
 		}
 
 		poll.add(refresh, 1);
@@ -123,21 +142,43 @@ return view.extend({
 				'--passes', passes
 			]).then(function(res) {
 				if (res.code !== 0) {
-					ui.addNotification(null, E('pre', {}, (res.stderr || res.stdout || 'не удалось запустить')), 'error');
+					summaryNode.textContent = res.stderr || res.stdout || 'не удалось запустить';
+					ui.addNotification(null, E('pre', {}, summaryNode.textContent), 'error');
+					return;
 				}
 				return refresh();
-			});
+			}).catch(showError);
+		}
+
+		function saveCustom() {
+			var text = document.getElementById('zp-custom').value;
+			return fs.exec(BIN, ['set-opt', text]).then(function(res) {
+				var msg = ((res.stdout || '') + (res.stderr || '')).trim();
+				if (res.code !== 0) {
+					summaryNode.textContent = msg || 'не удалось записать стратегию';
+					ui.addNotification(null, E('pre', {}, summaryNode.textContent), 'error');
+					return;
+				}
+				ui.addNotification(null, E('pre', {}, msg), 'info');
+				summaryNode.textContent = msg;
+			}).catch(showError);
 		}
 
 		function apply() {
 			return fs.exec(BIN, ['apply']).then(function(res) {
-				var text = (res.stdout || '') + (res.stderr || '');
-				if (res.code !== 0)
-					ui.addNotification(null, E('pre', {}, text || 'нечего записывать'), 'error');
-				else
-					ui.addNotification(null, E('pre', {}, text), 'info');
-				return refresh();
-			});
+				var text = ((res.stdout || '') + (res.stderr || '')).trim();
+				if (res.code !== 0) {
+					summaryNode.textContent = text || 'нечего записывать';
+					ui.addNotification(null, E('pre', {}, summaryNode.textContent), 'error');
+					return;
+				}
+				ui.addNotification(null, E('pre', {}, text), 'info');
+				summaryNode.textContent = text;
+				return fs.exec(BIN, ['show-opt']).then(function(cur) {
+					if (cur && cur.code === 0)
+						document.getElementById('zp-custom').value = cur.stdout || '';
+				});
+			}).catch(showError);
 		}
 
 		return E('div', { 'class': 'cbi-map' }, [
@@ -152,7 +193,7 @@ return view.extend({
 				'Победитель перепроверяется сразу и ещё раз после короткой паузы. Один curl — не браузер. ' +
 				'Если для видео не прошла ни одна QUIC-семья, предложение отключает QUIC и оставляет TCP. ' +
 				'Журнал обновляется каждую секунду: семья, страница или googlevideo.com, строка --lua-desync и результат open, timeout, reset или blocked. ' +
-				'NFQWS2_OPT меняется только кнопкой записи.'),
+				'Свою строку NFQWS2_OPT можно вставить ниже и записать отдельно. Автоподбор её не затирает, пока не нажата его кнопка записи.'),
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-section-node' }, [
 					E('div', { 'class': 'cbi-value' }, [
@@ -176,6 +217,23 @@ return view.extend({
 								'class': 'cbi-button cbi-button-save',
 								'click': ui.createHandlerFn(this, apply)
 							}, 'Записать сработавшую стратегию')
+						])
+					]),
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title', 'for': 'zp-custom' }, 'Своя стратегия'),
+						E('div', { 'class': 'cbi-value-field' }, [
+							E('textarea', {
+								'id': 'zp-custom',
+								'class': 'cbi-input-textarea',
+								'style': 'width:100%; min-height:9em; font-family:monospace',
+								'spellcheck': 'false'
+							}, custom),
+							E('div', { 'style': 'margin-top:0.5em' }, [
+								E('button', {
+									'class': 'cbi-button cbi-button-save',
+									'click': ui.createHandlerFn(this, saveCustom)
+								}, 'Записать свою стратегию')
+							])
 						])
 					])
 				])
