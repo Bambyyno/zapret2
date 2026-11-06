@@ -695,9 +695,19 @@ curl_with_subst_ip()
 	shift ; shift ; shift;
 	[ "$CURL_VERBOSE" = 1 ] && arg="-v"
 	[ "$CURL_CMD" = 1 ] && echo $CURL -w "%{time_total}" ${arg:+$arg }$connect_to "$@"
-	local tooks
-	tooks=$(ALL_PROXY="$ALL_PROXY" "$CURL" -w "%{time_total}" ${arg:+$arg }$connect_to "$@")
+	local tooks wspec httpc
+	wspec="%{time_total}"
+	# The picker log needs the HTTP status. Other blockcheck callers keep the old format.
+	if [ -n "${PICKER_LIVE:-}" ]; then
+		wspec="%{time_total} %{http_code}"
+	fi
+	tooks=$(ALL_PROXY="$ALL_PROXY" "$CURL" -w "$wspec" ${arg:+$arg }$connect_to "$@")
 	local ret=$?
+	if [ -n "${PICKER_LIVE:-}" ]; then
+		httpc=$(printf '%s\n' "$tooks" | awk '{print $2}')
+		tooks=$(printf '%s\n' "$tooks" | awk '{print $1}')
+		PICKER_LAST_HTTP=${httpc:-000}
+	fi
 	local tookms=$(awk "BEGIN {print int($tooks * 1000)}")
 	[ "$PACE" -gt "$tookms" ] && msleep $(($PACE - $tookms))
 	return "$ret"
@@ -1450,7 +1460,7 @@ check_domain_prolog()
 	else
 		code=$?
 		if [ -n "${PICKER_LIVE:-}" ]; then
-			picker_log "семья - | $(picker_where "$3") | строка: без обхода | результат: $(picker_result_word "$code")"
+			picker_log "семья - | $(picker_where "$3") | строка: без обхода | результат: $(picker_result_detail "$code")"
 		fi
 		curl_has_reason_to_continue $code || {
 			report_append "$3" "$1 ipv${IPV}" "test aborted, no reason to continue. curl code $(curl_translate_code $code)"

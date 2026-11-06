@@ -18,8 +18,22 @@ picker_need_def()
 	[ -n "$ZAPRET_BASE" ] || ZAPRET_BASE=$(CDPATH= cd -- "$(dirname "$0")/../.." && pwd)
 	# shellcheck disable=SC1091
 	. "$ZAPRET_BASE/blockcheck2.d/standard/def.inc"
-	IPVV=${IPVV:-}
-	[ "$IPV" = 6 ] && IPVV=6
+	# A previous IPv6 pass must not leave IPVV=6 for the IPv4 pass.
+	if [ "$IPV" = 6 ]; then
+		IPVV=6
+	else
+		IPVV=
+	fi
+}
+
+# IPv6 extension headers and ip6_ttl do nothing useful on an IPv4 test.
+picker_strip_foreign_ip()
+{
+	if [ "$IPV" = 6 ]; then
+		cat
+		return
+	fi
+	grep -v -E 'ip6_ttl|ip6_autottl|ip6_hopbyhop|ip6_destopt|ip6_routing|ip6_ah' || true
 }
 
 # Highest repeats= on the line. Missing repeats counts as 1.
@@ -67,7 +81,7 @@ picker_where()
 	esac
 }
 
-# open, timeout, reset, blocked. Anything else stays other.
+# open, timeout, reset, blocked. The log also keeps the numeric curl code.
 picker_result_word()
 {
 	case $1 in
@@ -76,6 +90,19 @@ picker_result_word()
 		35|52|55|56|reset) printf '%s\n' reset ;;
 		blocked) printf '%s\n' blocked ;;
 		*) printf '%s\n' other ;;
+	esac
+}
+
+# Curl's own exit code and the HTTP status it reported. 000 means no status line.
+picker_result_detail()
+{
+	code=$1
+	word=$(picker_result_word "$code")
+	http=${PICKER_LAST_HTTP:-000}
+	[ -n "$http" ] || http=000
+	case $word in
+		other) printf '%s\n' "curl $code http $http" ;;
+		*) printf '%s\n' "$word curl $code http $http" ;;
 	esac
 }
 
@@ -88,8 +115,8 @@ picker_log()
 # family | page or video domain | strategy line | phase | result
 picker_log_try()
 {
-	word=$(picker_result_word "$4")
-	picker_log "семья ${1} | $(picker_where "$2") | ${3} | ${5} | результат: ${word}"
+	detail=$(picker_result_detail "$4")
+	picker_log "семья ${1} | $(picker_where "$2") | ${3} | ${5} | результат: ${detail}"
 }
 
 # Canonical order. faked (fake-split and QUIC file blobs) is before wssize.
@@ -164,6 +191,13 @@ picker_store_result()
 	key=$1
 	status=$2
 	fam=$3
+	# A later miss must not erase a family that already opened a domain.
+	if [ "$status" = fail ]; then
+		cur=$(picker_state_value "$key")
+		case $cur in
+			ok:*) return 0 ;;
+		esac
+	fi
 	file=$(picker_state_path)
 	mkdir -p "$(dirname "$file")"
 	tmp=$(mktemp "${TMPDIR:-/tmp}/zapret2-state.XXXXXX") || return 1
@@ -617,6 +651,13 @@ picker_run_families()
 		rm -f "$stable"
 		return 1
 	fi
+	# TLS 1.3 used to walk every family again and could replace a TLS 1.2 open with a miss.
+	if [ "$proto" = tls13 ] && picker_proto_touched "$hits" tls12 "$IPV" "$dom"; then
+		picker_log "семья - | $(picker_where "$dom") | пропуск: семьи уже пройдены на TLS 1.2, второй полный круг не запускается"
+		picker_confirm_saved tls12 tls13 "$fn" "$dom" "$hits"
+		rm -f "$stable"
+		return 0
+	fi
 	key=$(picker_state_key "$proto" "$dom")
 	remembered=$(picker_state_value "$key")
 	start=$(picker_start_family "$key")
@@ -638,7 +679,7 @@ picker_run_families()
 		esac
 		PICKER_FAMILY=$fam
 		export PICKER_FAMILY
-		$gen | picker_family_stable "$fn" "$dom" "$stable"
+		$gen | picker_strip_foreign_ip | picker_family_stable "$fn" "$dom" "$stable"
 		if [ -s "$stable" ]; then
 			while IFS= read -r line; do
 				[ -n "$line" ] || continue
@@ -662,10 +703,61 @@ picker_run_families()
 	done
 	rm -f "$stable"
 	if [ "$found" != 0 ]; then
+		if picker_success_lines "$hits" "$proto" "$IPV" "$dom" | grep -q .; then
+			picker_log "семья - | $(picker_where "$dom") | пропуск: подтверждённое открытие остаётся, повторная неудача его не затирает"
+			return 0
+		fi
 		printf '%s %s %s -\n' "$proto" "$IPV" "$dom" >>"$hits"
 		return 1
 	fi
 	return 0
+}
+
+picker_proto_touched()
+{
+	# $1 hits $2 proto $3 ip $4 domain
+	[ -f "$1" ] || return 1
+	grep -q "^$2 $3 $4 " "$1"
+}
+
+picker_success_lines()
+{
+	# $1 hits $2 proto $3 ip $4 domain
+	[ -f "$1" ] || return 0
+	while read -r p i d line; do
+		[ "$p" = "$2" ] && [ "$i" = "$3" ] && [ "$d" = "$4" ] || continue
+		[ -n "$line" ] || continue
+		[ "$line" = "-" ] && continue
+		[ "$line" = portblock ] && continue
+		printf '%s\n' "$line"
+	done <"$1"
+}
+
+# Try lines already kept for $1 on protocol $2. A miss does not delete $1.
+picker_confirm_saved()
+{
+	src=$1
+	dst=$2
+	fn=$3
+	dom=$4
+	hits=$5
+	tmp=$(mktemp "${TMPDIR:-/tmp}/zapret2-keep.XXXXXX") || return 1
+	picker_success_lines "$hits" "$src" "$IPV" "$dom" >"$tmp"
+	[ -s "$tmp" ] || {
+		rm -f "$tmp"
+		return 0
+	}
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		picker_attempt "проверка $dst" "$fn" "$dom" $line
+		rc=$?
+		if [ "$rc" = 0 ]; then
+			printf '%s %s %s %s\n' "$dst" "$IPV" "$dom" "$line" >>"$hits"
+		else
+			picker_log "семья - | $(picker_where "$dom") | пропуск: строка TLS 1.2 не открыла $dst, полный перебор не повторяется"
+		fi
+	done <"$tmp"
+	rm -f "$tmp"
 }
 
 picker_full_port_block()
