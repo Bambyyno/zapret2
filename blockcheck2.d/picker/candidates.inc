@@ -68,7 +68,7 @@ picker_now_ms()
 picker_role()
 {
 	case $1 in
-		googlevideo.com) printf '%s\n' video ;;
+		*googlevideo.com) printf '%s\n' video ;;
 		*) printf '%s\n' page ;;
 	esac
 }
