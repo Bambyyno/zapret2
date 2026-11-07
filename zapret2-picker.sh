@@ -611,6 +611,58 @@ cmd_apply()
 	fi
 }
 
+# Print the current NFQWS2_OPT value, without the surrounding quotes.
+cmd_show_opt()
+{
+	[ -f "$ZAPRET_CONFIG" ] || die "no config: $ZAPRET_CONFIG"
+	awk '
+		/^#*[[:space:]]*NFQWS2_OPT="/ {
+			rest = $0
+			sub(/^[^"]*"/, "", rest)
+			if (rest ~ /"$/) {
+				sub(/"$/, "", rest)
+				printf "%s", rest
+				exit
+			}
+			out = rest
+			while ((getline line) > 0) {
+				if (line ~ /"$/) {
+					sub(/"$/, "", line)
+					if (line != "") out = (out == "" ? line : out "\n" line)
+					break
+				}
+				out = (out == "" ? line : out "\n" line)
+			}
+			printf "%s", out
+			exit
+		}
+		/^#*[[:space:]]*NFQWS2_OPT=/ {
+			sub(/^[^=]*=/, "")
+			gsub(/^["'\'']|["'\'']$/, "")
+			printf "%s", $0
+			exit
+		}
+	' "$ZAPRET_CONFIG"
+}
+
+# $1 is the whole strategy, including spaces and newlines. Empty clears it.
+cmd_set_opt()
+{
+	[ $# -le 1 ] || die "set-opt expects the strategy as one argument"
+	opt=${1-}
+	en=1
+	[ -n "$opt" ] || en=0
+	[ -f "$ZAPRET_CONFIG" ] || {
+		cp "$ZAPRET_BASE/config.default" "$ZAPRET_CONFIG"
+	}
+	picker_write_config "$opt" "$en"
+	echo "NFQWS2_OPT updated. Other config keys were left as they were. NFQWS2_ENABLE=$en."
+	if [ -x /etc/init.d/zapret2 ]; then
+		/etc/init.d/zapret2 restart
+		echo "service restarted"
+	fi
+}
+
 cmd_self_test()
 {
 	fail=0
@@ -781,6 +833,19 @@ EOF
 	check "confirmed open is kept for that domain" "printf '%s\n' \"\$opt6\" | grep -q 'hostlist-domains=youtubei.googleapis.com' && printf '%s\n' \"\$opt6\" | grep -q 'hostfakesplit:tcp_md5:repeats=1'"
 	check "failed neighbour is not in that profile" "! printf '%s\n' \"\$opt6\" | grep -q 'hostlist-domains=www.youtube.com'"
 	check "run does not mention writing before save" "grep -q 'not written' \"$0\""
+	cat >"$tmp/config" <<'EOF'
+OTHER=keep
+NFQWS2_OPT="
+--filter-tcp=443 --lua-desync=fake:blob=fake_default_tls
+"
+NFQWS2_ENABLE=0
+EOF
+	shown=$(ZAPRET_CONFIG="$tmp/config" "$0" show-opt)
+	check "show-opt reads the saved strategy" "printf '%s\n' \"\$shown\" | grep -q 'fake_default_tls'"
+	ZAPRET_CONFIG="$tmp/config" "$0" set-opt '--filter-udp=443 --lua-desync=fake:blob=fake_default_quic:repeats=1' >/dev/null
+	check "set-opt keeps other keys" "grep -q '^OTHER=keep$' \"$tmp/config\""
+	check "set-opt writes the pasted strategy" "grep -q 'fake_default_quic:repeats=1' \"$tmp/config\""
+	check "set-opt enables the service" "grep -q '^NFQWS2_ENABLE=1$' \"$tmp/config\""
 	rm -rf "$tmp"
 	[ "$fail" = 0 ] || exit 1
 	echo self-test passed
@@ -788,7 +853,7 @@ EOF
 
 usage()
 {
-	echo "usage: zapret2-picker.sh start-bg|run|status|apply|candidates|self-test" >&2
+	echo "usage: zapret2-picker.sh start-bg|run|status|apply|show-opt|set-opt|candidates|self-test" >&2
 	exit 1
 }
 
@@ -800,6 +865,8 @@ case $cmd in
 	run) cmd_run "$@" ;;
 	status) cmd_status ;;
 	apply) cmd_apply ;;
+	show-opt) cmd_show_opt ;;
+	set-opt) cmd_set_opt "$@" ;;
 	candidates) cmd_candidates "$@" ;;
 	self-test) cmd_self_test ;;
 	*) usage ;;

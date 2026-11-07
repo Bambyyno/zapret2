@@ -1,14 +1,20 @@
 {
 	"luci-app-zapret2": {
-		"description": "Start the zapret2 strategy test and apply NFQWS2_OPT",
+		"description": "Run the zapret2 strategy test and read or write NFQWS2_OPT",
 		"read": {
 			"ubus": {
 				"file": [ "exec" ]
+			},
+			"file": {
+				"/opt/zapret2/zapret2-picker.sh": [ "exec" ]
 			}
 		},
 		"write": {
 			"ubus": {
 				"file": [ "exec" ]
+			},
+			"file": {
+				"/opt/zapret2/zapret2-picker.sh": [ "exec" ]
 			}
 		}
 	}
