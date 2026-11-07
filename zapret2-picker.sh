@@ -228,6 +228,11 @@ picker_build_opt()
 "
 				continue
 			fi
+			if [ -s "$file" ] && [ "$(grep -c . "$file")" -eq 1 ] && grep -qx noconnect "$file"; then
+				notes="$notes$1 ipv$2: $dom has no connection (curl 7). Desync was not searched.
+"
+				continue
+			fi
 			if [ ! -s "$file" ] || { [ "$(grep -c . "$file")" -eq 1 ] && grep -qx '-' "$file"; }; then
 				notes="$notes$1 ipv$2 $role: $dom did not pass.
 "
@@ -727,7 +732,7 @@ cmd_self_test()
 	picker_log_try cheap googlevideo.com "--payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=1" 35 проба
 	picker_log "семья cheap | $(picker_where www.youtube.com) | запомнил неудачу. repeats не увеличены."
 	picker_log "тест закончен. NFQWS2_OPT не записан, ждёт кнопку «Записать сработавшую стратегию»."
-	check "live log names family domain line and result" "grep -q 'семья cheap | страница www.youtube.com | --payload=tls_client_hello --lua-desync=multisplit:pos=2 | проба | результат: timeout curl 28 http 000' \"$tmp/live\""
+	check "live log names family domain line and result" "grep -q 'семья cheap | ipv4 | страница www.youtube.com | --payload=tls_client_hello --lua-desync=multisplit:pos=2 | проба | результат: timeout curl 28 http 000' \"$tmp/live\""
 	check "video domain is labeled" "grep -q 'видео googlevideo.com' \"$tmp/live\" && grep -q 'результат: reset curl 35 http 000' \"$tmp/live\""
 	check "unknown curl code is not bucketed" "PICKER_LAST_HTTP=000 picker_result_detail 7 | grep -qx 'curl 7 http 000'"
 	check "live log remembers failure and waits for save" "grep -q 'запомнил неудачу' \"$tmp/live\" && grep -q 'ждёт кнопку' \"$tmp/live\""

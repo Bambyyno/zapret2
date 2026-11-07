@@ -1454,13 +1454,17 @@ check_domain_prolog()
 	if curl_test $1 $3; then
 		report_append "$3" "$1 ipv${IPV}" "working without bypass"
 		if [ -n "${PICKER_LIVE:-}" ]; then
-			picker_log "семья - | $(picker_where "$3") | строка: без обхода | пропуск: домен уже открывается, desync не ищется | результат: open"
+			picker_log "семья - | $(picker_ip_label) | $(picker_where "$3") | строка: без обхода | пропуск: домен уже открывается, desync не ищется | результат: open"
 		fi
 		[ "$SCANLEVEL" = force ] || return 1
 	else
 		code=$?
+		if [ -n "${PICKER_LIVE:-}" ] && [ "$code" = 7 ]; then
+			picker_mark_noconnect "$1" "$3"
+			return 1
+		fi
 		if [ -n "${PICKER_LIVE:-}" ]; then
-			picker_log "семья - | $(picker_where "$3") | строка: без обхода | результат: $(picker_result_detail "$code")"
+			picker_log "семья - | $(picker_ip_label) | $(picker_where "$3") | строка: без обхода | результат: $(picker_result_detail "$code")"
 		fi
 		curl_has_reason_to_continue $code || {
 			report_append "$3" "$1 ipv${IPV}" "test aborted, no reason to continue. curl code $(curl_translate_code $code)"

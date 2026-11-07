@@ -106,17 +106,40 @@ picker_result_detail()
 	esac
 }
 
+picker_ip_label()
+{
+	printf 'ipv%s\n' "${IPV:-4}"
+}
+
 picker_log()
 {
 	[ -n "${PICKER_LIVE:-}" ] || return 0
 	printf '%s\n' "$*" >>"$PICKER_LIVE"
 }
 
-# family | page or video domain | strategy line | phase | result
+# family | ip version | page or video domain | strategy line | phase | result
 picker_log_try()
 {
 	detail=$(picker_result_detail "$4")
-	picker_log "семья ${1} | $(picker_where "$2") | ${3} | ${5} | результат: ${detail}"
+	picker_log "семья ${1} | $(picker_ip_label) | $(picker_where "$2") | ${3} | ${5} | результат: ${detail}"
+}
+
+# Curl 7 means the connection never opened. Desync cannot change that.
+picker_mark_noconnect()
+{
+	# $1 curl test function name, $2 domain
+	case $1 in
+		*tls12*) proto=tls12 ;;
+		*tls13*) proto=tls13 ;;
+		*http3*|*quic*) proto=quic ;;
+		*) proto=http ;;
+	esac
+	hits=${PICKER_HITS:-}
+	if [ -n "$hits" ]; then
+		mkdir -p "$(dirname "$hits")"
+		printf '%s %s %s noconnect\n' "$proto" "${IPV:-4}" "$2" >>"$hits"
+	fi
+	picker_log "семья - | $(picker_ip_label) | $(picker_where "$2") | строка: без обхода | пропуск: нет соединения, desync не ищется | результат: $(picker_result_detail 7)"
 }
 
 # Canonical order. faked (fake-split and QUIC file blobs) is before wssize.
