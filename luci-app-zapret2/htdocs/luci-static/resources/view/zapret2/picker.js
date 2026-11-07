@@ -52,9 +52,13 @@ function splitStatus(text) {
 	var opt = '';
 	var log = '';
 	var state = 'idle';
+	var service = 'stopped';
 	var m = String(text || '').match(/^state=(\S+)/);
 	if (m)
 		state = m[1];
+	var s = String(text || '').match(/^service=(\S+)/m);
+	if (s)
+		service = s[1];
 	var parts = String(text || '').split(/^--- (\w+) ---$/m);
 	var i;
 	for (i = 1; i < parts.length; i += 2) {
@@ -65,7 +69,7 @@ function splitStatus(text) {
 		else if (parts[i] === 'log')
 			log = parts[i + 1] || '';
 	}
-	return { state: state, summary: summary.trim(), opt: opt.trim(), log: log.trim() };
+	return { state: state, service: service, summary: summary.trim(), opt: opt.trim(), log: log.trim() };
 }
 
 return view.extend({
@@ -91,6 +95,7 @@ return view.extend({
 		var custom = data[1] || '';
 		var parsed = splitStatus(raw);
 		var stateNode = E('div', { 'id': 'zp-state' }, parsed.state);
+		var serviceNode = E('div', { 'id': 'zp-service' }, parsed.service === 'running' ? 'включена' : 'выключена');
 		var summaryNode = E('pre', {
 			'id': 'zp-summary',
 			'style': 'white-space:pre-wrap; max-height:16em; overflow:auto'
@@ -121,6 +126,7 @@ return view.extend({
 			return fs.exec(BIN, ['status']).then(function(res) {
 				var next = splitStatus((res && res.stdout) || '');
 				stateNode.textContent = next.state;
+				serviceNode.textContent = next.service === 'running' ? 'включена' : 'выключена';
 				showSummary(next);
 				optNode.textContent = next.opt;
 				logNode.textContent = next.log;
@@ -146,6 +152,20 @@ return view.extend({
 					ui.addNotification(null, E('pre', {}, summaryNode.textContent), 'error');
 					return;
 				}
+				return refresh();
+			}).catch(showError);
+		}
+
+		function serviceCmd(action) {
+			return fs.exec(BIN, ['service', action]).then(function(res) {
+				var msg = ((res.stdout || '') + (res.stderr || '')).trim();
+				if (res.code !== 0) {
+					summaryNode.textContent = msg || 'не удалось переключить службу';
+					ui.addNotification(null, E('pre', {}, summaryNode.textContent), 'error');
+					return;
+				}
+				ui.addNotification(null, E('pre', {}, msg), 'info');
+				summaryNode.textContent = msg;
 				return refresh();
 			}).catch(showError);
 		}
@@ -193,9 +213,26 @@ return view.extend({
 				'Победитель перепроверяется сразу и ещё раз после короткой паузы. Один curl — не браузер. ' +
 				'Если для видео не прошла ни одна QUIC-семья, предложение отключает QUIC и оставляет TCP. ' +
 				'Журнал обновляется каждую секунду: семья, страница или googlevideo.com, строка --lua-desync и результат open, timeout, reset или blocked. ' +
-				'Свою строку NFQWS2_OPT можно вставить ниже и записать отдельно. Автоподбор её не затирает, пока не нажата его кнопка записи.'),
+				'Свою строку NFQWS2_OPT можно вставить ниже и записать отдельно. Автоподбор её не затирает, пока не нажата его кнопка записи. ' +
+				'Видео в приложении идёт с имён *.googlevideo.com. Подбор проверяет redirector.googlevideo.com и, если строка проходит, записывает её на googlevideo.com, включая поддомены.'),
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-section-node' }, [
+					E('div', { 'class': 'cbi-value' }, [
+						E('label', { 'class': 'cbi-value-title' }, 'Служба'),
+						E('div', { 'class': 'cbi-value-field' }, [
+							serviceNode,
+							' ',
+							E('button', {
+								'class': 'cbi-button cbi-button-apply',
+								'click': ui.createHandlerFn(this, serviceCmd, 'start')
+							}, 'Включить'),
+							' ',
+							E('button', {
+								'class': 'cbi-button cbi-button-remove',
+								'click': ui.createHandlerFn(this, serviceCmd, 'stop')
+							}, 'Выключить')
+						])
+					]),
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, 'Домены'),
 						E('div', { 'class': 'cbi-value-field' },

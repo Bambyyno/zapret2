@@ -20,7 +20,9 @@ NOTEFILE="$RUNDIR/notes.txt"
 umask 022
 
 # Fixed set. blockcheck skips a host that already answers with no bypass.
-YOUTUBE_DOMAINS="www.youtube.com youtu.be i.ytimg.com googlevideo.com youtubei.googleapis.com"
+# redirector.googlevideo.com is a real video hostname. The apex often refuses
+# the connection, while the Android app plays from *.googlevideo.com.
+YOUTUBE_DOMAINS="www.youtube.com youtu.be i.ytimg.com googlevideo.com redirector.googlevideo.com youtubei.googleapis.com"
 
 die()
 {
@@ -289,8 +291,15 @@ picker_build_opt()
 	}
 	passed_csv()
 	{
-		# $1 file of domain names, one per line
-		tr '\n' ',' <"$1" | sed 's/,$//'
+		# $1 file of domain names, one per line.
+		# Every googlevideo hostname becomes googlevideo.com: subdomains are included.
+		while read -r d; do
+			[ -n "$d" ] || continue
+			case $d in
+				*googlevideo.com) printf '%s\n' googlevideo.com ;;
+				*) printf '%s\n' "$d" ;;
+			esac
+		done <"$1" | awk 'NF && !seen[$0]++' | tr '\n' ',' | sed 's/,$//'
 	}
 	emit_split_profiles()
 	{
@@ -311,8 +320,12 @@ picker_build_opt()
 				printf '%s %s\n' "$cost" "$line"
 			done <"$work/$proto.$ip.$dom" | sort -n | head -n 3 | sed 's/^[0-9][0-9]* //' >"$one"
 			[ -s "$one" ] || continue
+			case $dom in
+				*googlevideo.com) hdom=googlevideo.com ;;
+				*) hdom=$dom ;;
+			esac
 			body=$(picker_body_from "$one")
-			add_profile "$filt --hostlist-domains=$dom $body"
+			add_profile "$filt --hostlist-domains=$hdom $body"
 			notes="$notes$proto ipv$ip: $dom keeps its own confirmed line.
 "
 		done <"$work/$proto.$ip.$role.passed"
@@ -564,6 +577,11 @@ cmd_status()
 		state=running
 	fi
 	echo "state=$state"
+	svc=stopped
+	if [ -x /etc/init.d/zapret2 ] && /etc/init.d/zapret2 status >/dev/null 2>&1; then
+		svc=running
+	fi
+	echo "service=$svc"
 	echo "--- summary ---"
 	[ -f "$SUMMARY" ] && cat "$SUMMARY"
 	echo "--- opt ---"
@@ -665,6 +683,32 @@ cmd_set_opt()
 	if [ -x /etc/init.d/zapret2 ]; then
 		/etc/init.d/zapret2 restart
 		echo "service restarted"
+	fi
+}
+
+cmd_service()
+{
+	# start or stop the installed service without touching the strategy text.
+	case $1 in
+		start) en=1 ;;
+		stop) en=0 ;;
+		*) die "service must be start or stop" ;;
+	esac
+	[ -f "$ZAPRET_CONFIG" ] || cp "$ZAPRET_BASE/config.default" "$ZAPRET_CONFIG"
+	opt=$(cmd_show_opt)
+	picker_write_config "$opt" "$en"
+	if [ ! -x /etc/init.d/zapret2 ]; then
+		echo "NFQWS2_ENABLE=$en. The init script is not installed."
+		return 0
+	fi
+	if [ "$en" = 1 ]; then
+		/etc/init.d/zapret2 enable
+		/etc/init.d/zapret2 start
+		echo "zapret2 started"
+	else
+		/etc/init.d/zapret2 stop
+		/etc/init.d/zapret2 disable
+		echo "zapret2 stopped"
 	fi
 }
 
@@ -851,6 +895,16 @@ EOF
 	check "set-opt keeps other keys" "grep -q '^OTHER=keep$' \"$tmp/config\""
 	check "set-opt writes the pasted strategy" "grep -q 'fake_default_quic:repeats=1' \"$tmp/config\""
 	check "set-opt enables the service" "grep -q '^NFQWS2_ENABLE=1$' \"$tmp/config\""
+	check "redirector is the video host" "[ \"$(picker_role redirector.googlevideo.com)\" = video ]"
+	cat >"$hits" <<'EOF'
+tls12 4 redirector.googlevideo.com --payload=tls_client_hello --lua-desync=hostfakesplit:tcp_md5:repeats=1
+EOF
+	NOTEFILE="$tmp/notes" picker_build_opt "$hits" >"$tmp/opt7"
+	opt7=$(cat "$tmp/opt7")
+	check "video profile covers googlevideo subdomains" "printf '%s\n' \"\$opt7\" | grep -q 'hostlist-domains=googlevideo.com' && ! printf '%s\n' \"\$opt7\" | grep -q 'hostlist-domains=redirector'"
+	ZAPRET_CONFIG="$tmp/config" "$0" service stop >/dev/null
+	check "service stop clears enable" "grep -q '^NFQWS2_ENABLE=0$' \"$tmp/config\""
+	check "service stop keeps the strategy" "grep -q 'fake_default_quic:repeats=1' \"$tmp/config\""
 	rm -rf "$tmp"
 	[ "$fail" = 0 ] || exit 1
 	echo self-test passed
@@ -858,7 +912,7 @@ EOF
 
 usage()
 {
-	echo "usage: zapret2-picker.sh start-bg|run|status|apply|show-opt|set-opt|candidates|self-test" >&2
+	echo "usage: zapret2-picker.sh start-bg|run|status|apply|show-opt|set-opt|service|candidates|self-test" >&2
 	exit 1
 }
 
@@ -872,6 +926,7 @@ case $cmd in
 	apply) cmd_apply ;;
 	show-opt) cmd_show_opt ;;
 	set-opt) cmd_set_opt "$@" ;;
+	service) cmd_service "$@" ;;
 	candidates) cmd_candidates "$@" ;;
 	self-test) cmd_self_test ;;
 	*) usage ;;
