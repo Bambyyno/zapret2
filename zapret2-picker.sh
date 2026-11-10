@@ -19,10 +19,33 @@ NOTEFILE="$RUNDIR/notes.txt"
 
 umask 022
 
-# Fixed set. blockcheck skips a host that already answers with no bypass.
+# Probe names. blockcheck skips a host that already answers with no bypass.
 # redirector.googlevideo.com is a real video hostname. The apex often refuses
-# the connection, while the Android app plays from *.googlevideo.com.
-YOUTUBE_DOMAINS="www.youtube.com youtu.be i.ytimg.com googlevideo.com redirector.googlevideo.com youtubei.googleapis.com"
+# the connection, while the player uses *.googlevideo.com.
+# Innertube in Chrome is www.youtube.com/youtubei/v1/, not a separate host.
+# i.ytimg.com and yt3.ggpht.com are real names. A name that does not resolve
+# is left as a DNS failure.
+YOUTUBE_DOMAINS="www.youtube.com youtube.com m.youtube.com youtu.be i.ytimg.com ytimg.com yt3.ggpht.com ggpht.com googlevideo.com redirector.googlevideo.com youtubei.googleapis.com"
+
+# Suffix labels written into the picker hostlists. nfqws2 includes subdomains,
+# so one label covers the names Chrome actually uses.
+YOUTUBE_PAGE_HOSTS="youtube.com
+youtu.be
+youtubei.googleapis.com
+ytimg.com
+ggpht.com"
+YOUTUBE_VIDEO_HOSTS="googlevideo.com"
+
+# The desync that reached googlevideo, then UDP 443 for the same names.
+# There is no service switch that drops UDP 443 only for a hostlist.
+# quic_initial_www_google_com.bin is already shipped; no new blob is added.
+picker_youtube_opt()
+{
+	page=/opt/zapret2/ipset/zapret-hosts-picker-page.txt
+	video=/opt/zapret2/ipset/zapret-hosts-picker-video.txt
+	quic=/opt/zapret2/files/fake/quic_initial_www_google_com.bin
+	printf '%s\n' "--filter-l3=ipv4 --filter-tcp=443 --filter-l7=tls --hostlist=$page --hostlist=$video --out-range=-s34228 --in-range=-s5556 --lua-desync=circular:fails=3 --in-range=x --payload=tls_client_hello --lua-desync=hostfakesplit:midhost=midsld:tcp_md5:repeats=1:strategy=1 --payload=tls_client_hello --lua-desync=hostfakesplit:tcp_md5:repeats=1:strategy=2 --new --filter-l3=ipv4 --filter-udp=443 --filter-l7=quic --hostlist=$page --hostlist=$video --blob=quic_google:@$quic --payload=quic_initial --lua-desync=fake:blob=quic_google:repeats=1"
+}
 
 die()
 {
@@ -472,8 +495,9 @@ cmd_run()
 	echo "A domain that already opens is not searched."
 	echo "Families: fake and split, TTL and blob, fakedsplit and QUIC blobs, then wssize and ipfrag."
 	echo "A remembered failure starts at the next family. repeats are not raised."
-	echo "Two or three passing lines are saved as circular strategy numbers."
+	echo "Two or three passing lines are saved as circular strategy numbers in the log."
 	echo "www.youtube.com is the page. googlevideo.com is the video host. One does not count for the other."
+	echo "The saved strategy is the Chrome profile: both hostfakesplit lines, then UDP 443 with quic_initial_www_google_com.bin."
 	echo "Up to $PASSES passes are kept. A much slower neighbor is dropped. The winner is retested, then once more after ${PICKER_DELAY:-3}s."
 	echo "NFQWS2_OPT is not written by the test."
 	echo "domains=$DOMAINS ip=$IPVS tls12=$ENABLE_TLS12 tls13=$ENABLE_TLS13 quic=$ENABLE_QUIC passes=$PASSES"
@@ -504,9 +528,9 @@ cmd_run()
 	) </dev/null >"$LOG" 2>&1
 	code=$?
 
-	if [ -s "$HITS" ]; then
-		NOTEFILE="$NOTEFILE" picker_build_opt "$HITS" >"$OPTFILE" || true
-	fi
+	# Curl is not Chrome. The proposal is the profile that reached gvs,
+	# for the suffix host set, plus UDP 443. Hits stay in the log.
+	picker_youtube_opt >"$OPTFILE"
 	{
 		# shellcheck disable=SC1091
 		. "$ZAPRET_BASE/blockcheck2.d/picker/candidates.inc"
@@ -527,12 +551,8 @@ cmd_run()
 			cat "$NOTEFILE"
 			echo
 		fi
-		if [ -s "$OPTFILE" ]; then
-			echo "Proposed NFQWS2_OPT (not applied yet):"
-			cat "$OPTFILE"
-		else
-			echo "No line passed. NFQWS2_OPT was not changed."
-		fi
+		echo "Proposed NFQWS2_OPT is the Chrome profile (not applied yet):"
+		cat "$OPTFILE"
 	} >"$SUMMARY"
 
 	restore_svc
@@ -603,17 +623,19 @@ picker_write_hostlists()
 {
 	# Only the picker-owned lists. User hostlists are not touched.
 	# Called from save, not from the test run.
+	# One label is a suffix: youtube.com includes www and m, ytimg.com includes
+	# i.ytimg.com, ggpht.com includes yt3.ggpht.com, googlevideo.com includes rr*.
 	opt=$1
 	base="${PICKER_LIST_BASE:-$ZAPRET_BASE}"
 	page="${base}/ipset/zapret-hosts-picker-page.txt"
 	video="${base}/ipset/zapret-hosts-picker-video.txt"
 	printf '%s\n' "$opt" | grep -q 'zapret-hosts-picker-page.txt' && {
 		mkdir -p "${base}/ipset"
-		printf '%s\n' www.youtube.com youtu.be i.ytimg.com youtubei.googleapis.com >"$page"
+		printf '%s\n' "$YOUTUBE_PAGE_HOSTS" >"$page"
 	}
 	printf '%s\n' "$opt" | grep -q 'zapret-hosts-picker-video.txt' && {
 		mkdir -p "${base}/ipset"
-		printf '%s\n' googlevideo.com >"$video"
+		printf '%s\n' "$YOUTUBE_VIDEO_HOSTS" >"$video"
 	}
 }
 
@@ -678,6 +700,7 @@ cmd_set_opt()
 	[ -f "$ZAPRET_CONFIG" ] || {
 		cp "$ZAPRET_BASE/config.default" "$ZAPRET_CONFIG"
 	}
+	picker_write_hostlists "$opt"
 	picker_write_config "$opt" "$en"
 	echo "NFQWS2_OPT updated. Other config keys were left as they were. NFQWS2_ENABLE=$en."
 	if [ -x /etc/init.d/zapret2 ]; then
@@ -905,6 +928,14 @@ EOF
 	ZAPRET_CONFIG="$tmp/config" "$0" service stop >/dev/null
 	check "service stop clears enable" "grep -q '^NFQWS2_ENABLE=0$' \"$tmp/config\""
 	check "service stop keeps the strategy" "grep -q 'fake_default_quic:repeats=1' \"$tmp/config\""
+	preset=$(picker_youtube_opt)
+	check "preset is the gvs hostfakesplit pair" "printf '%s\n' \"\$preset\" | grep -q 'hostfakesplit:midhost=midsld:tcp_md5:repeats=1:strategy=1' && printf '%s\n' \"\$preset\" | grep -q 'hostfakesplit:tcp_md5:repeats=1:strategy=2' && printf '%s\n' \"\$preset\" | grep -q 'payload=tls_client_hello'"
+	check "preset separates udp with --new" "printf '%s\n' \"\$preset\" | grep -q ' --new ' && printf '%s\n' \"\$preset\" | grep -q 'filter-udp=443' && printf '%s\n' \"\$preset\" | grep -q 'quic_initial_www_google_com.bin'"
+	check "preset matches config.default" "grep -F -q -e \"\$preset\" \"$ZAPRET_BASE/config.default\""
+	check "probe list includes chrome hosts" "printf '%s\n' \"\$YOUTUBE_DOMAINS\" | grep -qw www.youtube.com && printf '%s\n' \"\$YOUTUBE_DOMAINS\" | grep -qw m.youtube.com && printf '%s\n' \"\$YOUTUBE_DOMAINS\" | grep -qw yt3.ggpht.com && printf '%s\n' \"\$YOUTUBE_DOMAINS\" | grep -qw i.ytimg.com && printf '%s\n' \"\$YOUTUBE_DOMAINS\" | grep -qw ggpht.com && printf '%s\n' \"\$YOUTUBE_DOMAINS\" | grep -qw youtube.com"
+	PICKER_LIST_BASE="$tmp" picker_write_hostlists "$preset"
+	check "page list uses suffix labels" "grep -qx youtube.com \"$tmp/ipset/zapret-hosts-picker-page.txt\" && grep -qx ytimg.com \"$tmp/ipset/zapret-hosts-picker-page.txt\" && grep -qx ggpht.com \"$tmp/ipset/zapret-hosts-picker-page.txt\" && grep -qx youtu.be \"$tmp/ipset/zapret-hosts-picker-page.txt\" && grep -qx youtubei.googleapis.com \"$tmp/ipset/zapret-hosts-picker-page.txt\" && ! grep -qx www.youtube.com \"$tmp/ipset/zapret-hosts-picker-page.txt\" && ! grep -qx i.ytimg.com \"$tmp/ipset/zapret-hosts-picker-page.txt\""
+	check "video list is the googlevideo suffix" "grep -qx googlevideo.com \"$tmp/ipset/zapret-hosts-picker-video.txt\" && [ \"\$(grep -c . \"$tmp/ipset/zapret-hosts-picker-video.txt\")\" -eq 1 ]"
 	rm -rf "$tmp"
 	[ "$fail" = 0 ] || exit 1
 	echo self-test passed
@@ -912,7 +943,7 @@ EOF
 
 usage()
 {
-	echo "usage: zapret2-picker.sh start-bg|run|status|apply|show-opt|set-opt|service|candidates|self-test" >&2
+	echo "usage: zapret2-picker.sh start-bg|run|status|apply|show-opt|set-opt|service|write-hostlists|candidates|self-test" >&2
 	exit 1
 }
 
@@ -926,6 +957,7 @@ case $cmd in
 	apply) cmd_apply ;;
 	show-opt) cmd_show_opt ;;
 	set-opt) cmd_set_opt "$@" ;;
+	write-hostlists) picker_write_hostlists "$(picker_youtube_opt)" ;;
 	service) cmd_service "$@" ;;
 	candidates) cmd_candidates "$@" ;;
 	self-test) cmd_self_test ;;
