@@ -208,13 +208,9 @@ return view.extend({
 				'Если домен уже открывается без обхода, поиск по нему не идёт. ' +
 				'Семьи: fake и split, TTL и blob, fakedsplit и QUIC-blob, затем wssize. ' +
 				'Если запомненная семья снова не проходит, следующая начинается со следующей семьи, без увеличения repeats. ' +
-				'Две или три прошедшие строки пишутся как circular strategy=1..3. Страница и googlevideo.com — разные --hostlist-domains. ' +
-				'В одной семье слишком медленная относительно соседней строка отбрасывается. Предпочитается вариант без wssize. ' +
-				'Победитель перепроверяется сразу и ещё раз после короткой паузы. Один curl — не браузер. ' +
-				'Если для видео не прошла ни одна QUIC-семья, предложение отключает QUIC и оставляет TCP. ' +
-				'Журнал обновляется каждую секунду: семья, страница или googlevideo.com, строка --lua-desync и результат open, timeout, reset или blocked. ' +
-				'Свою строку NFQWS2_OPT можно вставить ниже и записать отдельно. Автоподбор её не затирает, пока не нажата его кнопка записи. ' +
-				'Видео в приложении идёт с имён *.googlevideo.com. Подбор проверяет redirector.googlevideo.com и, если строка проходит, записывает её на googlevideo.com, включая поддомены.'),
+				'Журнал curl остаётся журналом. Запись ставит профиль Chrome, который дошёл до googlevideo: два hostfakesplit в одном circular, затем --new и UDP 443 с уже лежащим quic_initial_www_google_com.bin. ' +
+				'Листы — суффиксы. youtube.com включает www и m, ytimg.com включает i.ytimg.com, ggpht.com включает yt3.ggpht.com, googlevideo.com включает rr*. ' +
+				'Один curl — не браузер. Свою строку NFQWS2_OPT можно вставить ниже и записать отдельно.'),
 			E('div', { 'class': 'cbi-section' }, [
 				E('div', { 'class': 'cbi-section-node' }, [
 					E('div', { 'class': 'cbi-value' }, [
@@ -236,7 +232,7 @@ return view.extend({
 					E('div', { 'class': 'cbi-value' }, [
 						E('label', { 'class': 'cbi-value-title' }, 'Домены'),
 						E('div', { 'class': 'cbi-value-field' },
-							'www.youtube.com, youtu.be, i.ytimg.com, googlevideo.com, youtubei.googleapis.com')
+							'youtube.com, youtu.be, youtubei.googleapis.com, googlevideo.com, ytimg.com, ggpht.com')
 					]),
 					field('zp-ip', 'IP (4, 6 или 46)', '4'),
 					choice('zp-passes', 'Проходы и перепроверка', ['2', '3']),

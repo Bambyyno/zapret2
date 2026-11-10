@@ -35,6 +35,9 @@ copy_dir "$ZAPRET/common" "$DEST/opt/zapret2/common"
 copy_dir "$ZAPRET/lua" "$DEST/opt/zapret2/lua"
 copy_dir "$ZAPRET/blockcheck2.d" "$DEST/opt/zapret2/blockcheck2.d"
 copy_dir "$ZAPRET/ipset" "$DEST/opt/zapret2/ipset"
+# zapret-hosts*.txt is gitignored. The suffix lists are written here so the
+# package still contains the files the YouTube profile names.
+PICKER_LIST_BASE="$DEST/opt/zapret2" "$ZAPRET/zapret2-picker.sh" write-hostlists
 copy_dir "$ZAPRET/files/fake" "$DEST/opt/zapret2/files/fake"
 copy_dir "$ZAPRET/init.d/openwrt" "$DEST/opt/zapret2/init.d/openwrt"
 

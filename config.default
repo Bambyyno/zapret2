@@ -84,11 +84,11 @@ NFQWS2_UDP_PKT_IN=3
 # use <HOSTLIST> and <HOSTLIST_NOAUTO> placeholders to engage standard hostlists and autohostlist in ipset dir
 # hostlist markers are replaced to empty string if MODE_FILTER does not satisfy
 # <HOSTLIST_NOAUTO> appends ipset/zapret-hosts-auto.txt as normal list
-NFQWS2_OPT="
---filter-tcp=80 --filter-l7=http <HOSTLIST> --payload=http_req --lua-desync=fake:blob=fake_default_http:tcp_md5 --lua-desync=multisplit:pos=method+2 --new
---filter-tcp=443 --filter-l7=tls <HOSTLIST> --payload=tls_client_hello --lua-desync=fake:blob=fake_default_tls:tcp_md5:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld --new
---filter-udp=443 --filter-l7=quic <HOSTLIST_NOAUTO> --payload=quic_initial --lua-desync=fake:blob=fake_default_quic:repeats=6
-"
+# YouTube Chrome profile. Page and video names are suffix labels in the picker
+# hostlists (subdomains included). UDP 443 uses the shipped Google QUIC initial.
+# <HOSTLIST> is not used here: MODE_FILTER=none would strip it, and these names
+# must match even when the general list is empty.
+NFQWS2_OPT="--filter-l3=ipv4 --filter-tcp=443 --filter-l7=tls --hostlist=/opt/zapret2/ipset/zapret-hosts-picker-page.txt --hostlist=/opt/zapret2/ipset/zapret-hosts-picker-video.txt --out-range=-s34228 --in-range=-s5556 --lua-desync=circular:fails=3 --in-range=x --payload=tls_client_hello --lua-desync=hostfakesplit:midhost=midsld:tcp_md5:repeats=1:strategy=1 --payload=tls_client_hello --lua-desync=hostfakesplit:tcp_md5:repeats=1:strategy=2 --new --filter-l3=ipv4 --filter-udp=443 --filter-l7=quic --hostlist=/opt/zapret2/ipset/zapret-hosts-picker-page.txt --hostlist=/opt/zapret2/ipset/zapret-hosts-picker-video.txt --blob=quic_google:@/opt/zapret2/files/fake/quic_initial_www_google_com.bin --payload=quic_initial --lua-desync=fake:blob=quic_google:repeats=1"
 
 # none,ipset,hostlist,autohostlist
 MODE_FILTER=none
